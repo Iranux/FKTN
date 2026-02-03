@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
-# Iranux FKTN - Installer + Iranux Management
-# Canonical file: Install-FKTN.sh
+# Iranux FKTN - Installer (Install-FKTN.sh)
+# - Installs Docker + Compose (with fallbacks)
+# - Deploys fptnvpn/fptn-vpn-server via docker compose
+# - Installs Iranux management panel from GitHub (Iranux-Menu.sh)
 # ============================================================
 
 set -Eeuo pipefail
@@ -13,11 +15,14 @@ COMPOSE_FILE="${BASE_DIR}/docker-compose.yml"
 ENV_FILE="${BASE_DIR}/.env"
 STATE_DIR="${BASE_DIR}/state"
 
-MANAGER="/usr/local/sbin/${APP_NAME}"
+MANAGER_BIN="/usr/local/sbin/${APP_NAME}"
 SYMLINK_CAP="/usr/local/bin/Iranux"
 SYMLINK_LOW="/usr/local/bin/iranux"
 
-GITHUB_RAW_URL="https://raw.githubusercontent.com/Iranux/FKTN/main/Install-FKTN.sh"
+# Raw URLs (repo)
+INSTALLER_RAW_URL="https://raw.githubusercontent.com/Iranux/FKTN/main/Install-FKTN.sh"
+MENU_RAW_URL="https://raw.githubusercontent.com/Iranux/FKTN/main/Iranux-Menu.sh"
+
 FPTN_IMAGE="fptnvpn/fptn-vpn-server:latest"
 
 RETRY_MAX=3
@@ -28,17 +33,17 @@ warn() { echo -e "\e[33m[!]\e[0m $*" >&2; }
 die()  { echo -e "\e[31m[x]\e[0m $*" >&2; exit 1; }
 
 on_err() {
-  local exit_code=$?
+  local ec=$?
   warn "Installer failed."
   warn "Line: ${BASH_LINENO[0]} | Command: ${BASH_COMMAND}"
-  warn "Exit code: ${exit_code}"
-  # Show helpful context if dockerd is relevant
+  warn "Exit code: ${ec}"
   if command -v docker >/dev/null 2>&1; then
     if ! docker info >/dev/null 2>&1; then
       warn "Docker daemon not reachable at failure time."
+      [[ -f /var/log/dockerd.log ]] && tail -n 80 /var/log/dockerd.log 2>/dev/null || true
     fi
   fi
-  exit "${exit_code}"
+  exit "${ec}"
 }
 trap on_err ERR
 
@@ -94,17 +99,44 @@ apt_install_min() {
   retry apt-get install -y --no-install-recommends "$@"
 }
 
+# Self-update installer (forced fresh)
 self_update_from_github() {
   [[ "${1:-}" == "--no-self-update" ]] && return 0
   local tmp="/tmp/${APP_NAME}-Install-FKTN.latest.sh"
   log "Fetching latest installer from GitHub (forced fresh)..."
-  if retry curl -fsS -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${GITHUB_RAW_URL}" -o "${tmp}"; then
+  if retry curl -fsS -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${INSTALLER_RAW_URL}" -o "${tmp}"; then
     chmod +x "${tmp}"
     log "Re-executing the latest installer from GitHub..."
     exec bash "${tmp}" --no-self-update
   else
     warn "Could not fetch latest installer from GitHub. Continuing with local script."
   fi
+}
+
+detect_public_ipv4() {
+  local ip=""
+  ip="$(curl -fsS4 --max-time 8 https://api.ipify.org || true)"
+  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  echo "${ip}"
+}
+
+port_in_use() {
+  local p="$1"
+  ss -ltnH "sport = :${p}" 2>/dev/null | grep -q .
+}
+
+pick_port_safe() {
+  local preferred=443
+  if ! port_in_use "${preferred}"; then echo "${preferred}"; return 0; fi
+  for p in 8443 9443 10443 11443 12443; do
+    if ! port_in_use "${p}"; then echo "${p}"; return 0; fi
+  done
+  local i p
+  for i in {1..50}; do
+    p=$(( (RANDOM % 20001) + 20000 ))
+    if ! port_in_use "${p}"; then echo "${p}"; return 0; fi
+  done
+  echo "443"
 }
 
 ensure_tun() {
@@ -120,46 +152,7 @@ ensure_dirs() {
   chmod 700 "${BASE_DIR}" || true
 }
 
-detect_public_ipv4() {
-  local ip=""
-  ip="$(curl -fsS4 --max-time 8 https://api.ipify.org || true)"
-  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  echo "${ip}"
-}
-
-# ---- safer port detection (no silent stop, no loops) ----
-port_in_use() {
-  local p="$1"
-  # Return 0 only if there is at least one LISTEN socket on that port
-  ss -ltnH "sport = :${p}" 2>/dev/null | grep -q .
-}
-
-pick_port_safe() {
-  local preferred=443
-  if ! port_in_use "${preferred}"; then
-    echo "${preferred}"
-    return 0
-  fi
-  for p in 8443 9443 10443 11443 12443; do
-    if ! port_in_use "${p}"; then
-      echo "${p}"
-      return 0
-    fi
-  done
-  # Last resort: choose a random high port with limited tries (no infinite loops)
-  local i p
-  for i in {1..50}; do
-    p=$(( (RANDOM % 20001) + 20000 ))
-    if ! port_in_use "${p}"; then
-      echo "${p}"
-      return 0
-    fi
-  done
-  # Worst-case fallback
-  echo "443"
-}
-
-# ---- systemd-less dockerd helpers ----
+# --- Docker daemon helpers (systemd-less compatible) ---
 systemd_usable() {
   cmd_exists systemctl || return 1
   systemctl list-units >/dev/null 2>&1 && return 0
@@ -191,6 +184,7 @@ start_docker_daemon_best_effort() {
   nohup /usr/sbin/dockerd >/var/log/dockerd.log 2>&1 & disown || true
   sleep 2
   docker_daemon_running && return 0
+
   return 1
 }
 
@@ -198,9 +192,7 @@ ensure_dockerd_persistence_if_no_systemd() {
   systemd_usable && return 0
   cmd_exists crontab || return 0
   local line='@reboot /usr/sbin/dockerd >/var/log/dockerd.log 2>&1 &'
-  if crontab -l 2>/dev/null | grep -Fq "$line"; then
-    return 0
-  fi
+  crontab -l 2>/dev/null | grep -Fq "$line" && return 0
   log "Systemd not usable. Adding cron @reboot to start dockerd..."
   (crontab -l 2>/dev/null; echo "$line") | crontab -
 }
@@ -218,9 +210,6 @@ docker_repo_install() {
   # shellcheck disable=SC1091
   source /etc/os-release
   local codename="${VERSION_CODENAME:-}"
-  if [[ -z "${codename}" ]] && cmd_exists lsb_release; then
-    codename="$(lsb_release -cs 2>/dev/null || true)"
-  fi
   [[ -n "${codename}" ]] || die "Cannot detect Ubuntu codename for Docker repo."
 
   cat > /etc/apt/sources.list.d/docker.list <<EOF
@@ -235,16 +224,10 @@ ensure_docker() {
   if cmd_exists docker && docker --version >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     log "Docker and Docker Compose are already installed."
   else
-    log "Installing required packages..."
     if ! cmd_exists docker; then
       log "Installing Docker (docker.io) from Ubuntu repos..."
       apt_install_min docker.io || true
     fi
-
-    if ! cmd_exists add-apt-repository; then
-      apt_install_min software-properties-common >/dev/null 2>&1 || true
-    fi
-    cmd_exists add-apt-repository && add-apt-repository -y universe >/dev/null 2>&1 || true
 
     apt_prepare_fast
 
@@ -269,9 +252,7 @@ ensure_docker() {
   ensure_dockerd_persistence_if_no_systemd
 }
 
-# -------------------------
-# SAFE targeted clean (never abort)
-# -------------------------
+# SAFE targeted clean
 nuclear_clean_project() {
   log "Nuclear clean (targeted) for ${APP_NAME}..."
   if cmd_exists docker; then
@@ -279,14 +260,13 @@ nuclear_clean_project() {
       warn "Docker daemon not running during clean. Best-effort start..."
       start_docker_daemon_best_effort || true
     fi
-
     if docker_daemon_running && [[ -f "${COMPOSE_FILE}" ]]; then
-      (cd "${BASE_DIR}" && docker compose down --remove-orphans --volumes >/dev/null 2>&1) || true
+      (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" down --remove-orphans --volumes >/dev/null 2>&1) || true
     fi
   fi
 
   rm -f "${SYMLINK_CAP}" "${SYMLINK_LOW}" >/dev/null 2>&1 || true
-  rm -f "${MANAGER}" >/dev/null 2>&1 || true
+  rm -f "${MANAGER_BIN}" >/dev/null 2>&1 || true
   rm -rf "${BASE_DIR}" >/dev/null 2>&1 || true
   rm -rf /tmp/${APP_NAME}-* >/dev/null 2>&1 || true
   log "Clean complete."
@@ -337,18 +317,23 @@ EOF
   [[ -s "${ENV_FILE}" ]] || die "Failed to write ${ENV_FILE}"
 }
 
-write_manager_panel() {
-  cat > "${MANAGER}" <<'BASH'
-#!/usr/bin/env bash
-set -euo pipefail
-BASE_DIR="/opt/iranux-fktn"
-ENV_FILE="${BASE_DIR}/.env"
-cd "${BASE_DIR}" 2>/dev/null || { echo "Not installed."; exit 1; }
-docker compose --env-file "${ENV_FILE}" ps
-BASH
-  chmod 0755 "${MANAGER}"
-  ln -sf "${MANAGER}" "${SYMLINK_CAP}"
-  ln -sf "${MANAGER}" "${SYMLINK_LOW}"
+compose_up() {
+  log "Starting container..."
+  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" up -d)
+}
+
+# ✅ NEW: install management panel from GitHub (forced fresh)
+install_manager_panel_from_github() {
+  local tmp="/tmp/${APP_NAME}-menu.latest.sh"
+  log "Fetching latest Iranux management panel (forced fresh)..."
+  if retry curl -fsS -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${MENU_RAW_URL}" -o "${tmp}"; then
+    chmod +x "${tmp}"
+    install -m 0755 "${tmp}" "${MANAGER_BIN}"
+    ln -sf "${MANAGER_BIN}" "${SYMLINK_CAP}"
+    ln -sf "${MANAGER_BIN}" "${SYMLINK_LOW}"
+  else
+    die "Could not fetch Iranux management panel from GitHub (${MENU_RAW_URL}). Ensure Iranux-Menu.sh exists in repo."
+  fi
 }
 
 install_main() {
@@ -376,10 +361,10 @@ install_main() {
   write_compose_file
   write_env_file "${port}" "${pub_ip}"
 
-  log "Starting container..."
-  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" up -d)
+  compose_up
 
-  write_manager_panel
+  # ✅ install menu here
+  install_manager_panel_from_github
 
   log "Installation completed successfully."
   log "Run management panel: Iranux"
