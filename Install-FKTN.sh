@@ -304,6 +304,23 @@ services:
       - "\${FPTN_PORT}:443/tcp"
     volumes:
       - ./fptn-server-data:/etc/fptn
+    env_file:
+      - ./.env
+    environment:
+      - ENABLE_DETECT_PROBING=\${ENABLE_DETECT_PROBING}
+      - DEFAULT_PROXY_DOMAIN=\${DEFAULT_PROXY_DOMAIN}
+      - ALLOWED_SNI_LIST=\${ALLOWED_SNI_LIST}
+      - DISABLE_BITTORRENT=\${DISABLE_BITTORRENT}
+      - PROMETHEUS_SECRET_ACCESS_KEY=\${PROMETHEUS_SECRET_ACCESS_KEY}
+      - USE_REMOTE_SERVER_AUTH=\${USE_REMOTE_SERVER_AUTH}
+      - REMOTE_SERVER_AUTH_HOST=\${REMOTE_SERVER_AUTH_HOST}
+      - REMOTE_SERVER_AUTH_PORT=\${REMOTE_SERVER_AUTH_PORT}
+      - MAX_ACTIVE_SESSIONS_PER_USER=\${MAX_ACTIVE_SESSIONS_PER_USER}
+      - SERVER_EXTERNAL_IPS=\${SERVER_EXTERNAL_IPS}
+      - DNS_IPV4_PRIMARY=\${DNS_IPV4_PRIMARY}
+      - DNS_IPV4_SECONDARY=\${DNS_IPV4_SECONDARY}
+      - DNS_IPV6_PRIMARY=\${DNS_IPV6_PRIMARY}
+      - DNS_IPV6_SECONDARY=\${DNS_IPV6_SECONDARY}
 YAML
   [[ -s "${COMPOSE_FILE}" ]] || die "Failed to write ${COMPOSE_FILE}"
 }
@@ -313,8 +330,42 @@ write_env_file() {
   cat > "${ENV_FILE}" <<EOF
 FPTN_PORT=${port}
 SERVER_EXTERNAL_IPS=${pubip}
+ENABLE_DETECT_PROBING=true
+DEFAULT_PROXY_DOMAIN=cdnvideo.com
+ALLOWED_SNI_LIST=
+DISABLE_BITTORRENT=true
+PROMETHEUS_SECRET_ACCESS_KEY=
+USE_REMOTE_SERVER_AUTH=false
+REMOTE_SERVER_AUTH_HOST=
+REMOTE_SERVER_AUTH_PORT=443
+MAX_ACTIVE_SESSIONS_PER_USER=3
+DNS_IPV4_PRIMARY=8.8.8.8
+DNS_IPV4_SECONDARY=8.8.4.4
+DNS_IPV6_PRIMARY=2001:4860:4860::8888
+DNS_IPV6_SECONDARY=2001:4860:4860::8844
 EOF
   [[ -s "${ENV_FILE}" ]] || die "Failed to write ${ENV_FILE}"
+}
+
+ensure_fptn_data_files() {
+  mkdir -p "${DATA_DIR}"
+  if [[ ! -f "${DATA_DIR}/users.list" ]]; then
+    touch "${DATA_DIR}/users.list"
+  fi
+  chmod 600 "${DATA_DIR}/users.list" >/dev/null 2>&1 || true
+}
+
+ensure_tls_certs() {
+  local cn="$1"
+  if [[ -f "${DATA_DIR}/server.key" && -f "${DATA_DIR}/server.crt" ]]; then
+    return 0
+  fi
+  log "Generating self-signed TLS certificate for initial setup..."
+  openssl genrsa -out "${DATA_DIR}/server.key" 2048 >/dev/null 2>&1
+  openssl req -new -x509 -key "${DATA_DIR}/server.key" \
+    -out "${DATA_DIR}/server.crt" -days 365 -subj "/CN=${cn}" >/dev/null 2>&1
+  chmod 600 "${DATA_DIR}/server.key" >/dev/null 2>&1 || true
+  chmod 644 "${DATA_DIR}/server.crt" >/dev/null 2>&1 || true
 }
 
 compose_up() {
@@ -360,6 +411,8 @@ install_main() {
   log "Writing docker-compose.yml and .env..."
   write_compose_file
   write_env_file "${port}" "${pub_ip}"
+  ensure_fptn_data_files
+  ensure_tls_certs "${pub_ip}"
 
   compose_up
 
