@@ -1,460 +1,400 @@
 #!/usr/bin/env bash
 # ============================================================
-# Iranux FKTN - Installer (Install-FKTN.sh)
-# - Installs Docker + Compose, deploys fptnvpn/fptn-vpn-server
-# - Installs Iranux management panel from GitHub (Iranux-Menu.sh)
-# - Ubuntu supported (20.04/22.04/24.04)
+# Iranux FKTN - Management Panel (Iranux-Menu.sh)
+# - Run: sudo Iranux   (or sudo iranux)
 # ============================================================
 
 set -Eeuo pipefail
 
-# -------------------------
-# Constants
-# -------------------------
 APP_NAME="iranux-fktn"
 BASE_DIR="/opt/${APP_NAME}"
 DATA_DIR="${BASE_DIR}/fptn-server-data"
-COMPOSE_FILE="${BASE_DIR}/docker-compose.yml"
 ENV_FILE="${BASE_DIR}/.env"
 STATE_DIR="${BASE_DIR}/state"
-
-MANAGER_BIN="/usr/local/sbin/${APP_NAME}"
-SYMLINK_CAP="/usr/local/bin/Iranux"
-SYMLINK_LOW="/usr/local/bin/iranux"
-
-# Your repo raw URLs
-INSTALLER_RAW_URL="https://raw.githubusercontent.com/Iranux/FKTN/main/Install-FKTN.sh"
-MENU_RAW_URL="https://raw.githubusercontent.com/Iranux/FKTN/main/Iranux-Menu.sh"
-
-# Docker image
-FPTN_IMAGE="fptnvpn/fptn-vpn-server:latest"
-
-# Retry policy
-RETRY_MAX=3
-RETRY_DELAY=2
+DOMAIN_STATE="${STATE_DIR}/domain.conf"
+CERT_STATE="${STATE_DIR}/cert.conf"
 
 # -------------------------
-# Logging & error trap
+# UI helpers
 # -------------------------
-log()  { echo -e "\e[32m[+]\e[0m $*"; }
-warn() { echo -e "\e[33m[!]\e[0m $*" >&2; }
-die()  { echo -e "\e[31m[x]\e[0m $*" >&2; exit 1; }
+green() { echo -e "\e[32m$*\e[0m"; }
+yellow(){ echo -e "\e[33m$*\e[0m"; }
+red()   { echo -e "\e[31m$*\e[0m"; }
 
-on_err() {
-  local ec=$?
-  warn "Installer failed."
-  warn "Line: ${BASH_LINENO[0]} | Command: ${BASH_COMMAND}"
-  warn "Exit code: ${ec}"
-  # Show Docker daemon hint if relevant
-  if command -v docker >/dev/null 2>&1; then
-    if ! docker info >/dev/null 2>&1; then
-      warn "Docker daemon not reachable at failure time."
-      if [[ -f /var/log/dockerd.log ]]; then
-        warn "Last 80 lines of /var/log/dockerd.log:"
-        tail -n 80 /var/log/dockerd.log 2>/dev/null || true
-      fi
-    fi
-  fi
-  exit "${ec}"
-}
-trap on_err ERR
+die(){ red "[x] $*"; exit 1; }
 
-cmd_exists() { command -v "$1" >/dev/null 2>&1; }
-
-retry() {
-  local n=1
-  local cmd=("$@")
-  until "${cmd[@]}"; do
-    if (( n >= RETRY_MAX )); then
-      return 1
-    fi
-    warn "Retry $n/${RETRY_MAX} failed: ${cmd[*]}"
-    sleep "${RETRY_DELAY}"
-    ((n++))
-  done
-}
-
-# -------------------------
-# Root escalation
-# -------------------------
-need_root() {
+need_root(){
   if [[ "${EUID}" -ne 0 ]]; then
-    if cmd_exists sudo; then
-      exec sudo -E bash "$0" "$@"
+    die "Run as root: sudo Iranux"
+  fi
+}
+
+require_install(){
+  [[ -d "${BASE_DIR}" ]] || die "Not installed. Run installer first."
+  [[ -f "${ENV_FILE}" ]] || die "Missing ${ENV_FILE}. Re-run installer."
+  mkdir -p "${STATE_DIR}" >/dev/null 2>&1 || true
+}
+
+compose(){
+  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" "$@")
+}
+
+get_env(){
+  local k="$1"
+  grep -E "^${k}=" "${ENV_FILE}" | head -n1 | cut -d'=' -f2- || true
+}
+
+public_ip(){ get_env SERVER_EXTERNAL_IPS; }
+public_port(){ get_env FPTN_PORT; }
+
+domain_get(){
+  [[ -f "${DOMAIN_STATE}" ]] && cat "${DOMAIN_STATE}" || true
+}
+
+tls_status_line(){
+  [[ -f "${CERT_STATE}" ]] && cat "${CERT_STATE}" || echo "TLS: self-signed (default)"
+}
+
+endpoint_line(){
+  local port dom ip
+  ip="$(public_ip)"; port="$(public_port)"; dom="$(domain_get)"
+  if [[ -n "${dom}" ]]; then
+    if [[ "${port}" == "443" ]]; then
+      echo "Endpoint: ${dom} (preferred) | Fallback: ${ip}:443"
     else
-      die "Root required. Install sudo or run as root."
+      echo "Endpoint: ${dom}:${port} (preferred) | Fallback: ${ip}:${port}"
+    fi
+  else
+    echo "Endpoint: ${ip}:${port}"
+  fi
+}
+
+# Best-effort user count: tries common paths/tools; if not possible -> unknown
+user_count(){
+  local out=""
+  if compose exec -T fptn-server sh -c "command -v fptn-passwd >/dev/null 2>&1" >/dev/null 2>&1; then
+    out="$(compose exec -T fptn-server sh -c "fptn-passwd --list-users 2>/dev/null || true" || true)"
+    if [[ -n "${out}" ]]; then
+      echo "${out}" | sed '/^\s*$/d' | wc -l | tr -d ' '
+      return 0
     fi
   fi
+  echo "unknown"
+}
+
+banner(){
+  local ip port dom tls users ep
+  ip="$(public_ip)"; port="$(public_port)"; dom="$(domain_get)"
+  tls="$(tls_status_line)"; users="$(user_count)"; ep="$(endpoint_line)"
+  echo "============================================================"
+  echo " Iranux | FKTN VPN Server Management"
+  echo "------------------------------------------------------------"
+  echo " Server IP   : ${ip:-unknown}"
+  echo " Server Port : ${port:-unknown}"
+  echo " Users       : ${users}"
+  echo " Domain      : ${dom:-not set}"
+  echo " ${ep}"
+  echo " ${tls}"
+  echo "============================================================"
+}
+
+pause(){
+  echo
+  read -rp "Press Enter to continue..." _ || true
 }
 
 # -------------------------
-# OS checks
+# Core actions
 # -------------------------
-detect_ubuntu() {
-  [[ -f /etc/os-release ]] || die "Cannot detect OS. /etc/os-release missing."
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  [[ "${ID:-}" == "ubuntu" ]] || die "Unsupported OS: ${ID:-unknown}. Ubuntu only."
+status(){
+  compose ps
 }
 
-ensure_internet() {
-  log "Checking internet connectivity (HTTPS)..."
-  retry curl -fsS --max-time 8 https://api.ipify.org >/dev/null 2>&1 || die "No internet/HTTPS connectivity."
+tail_logs(){
+  compose logs --tail 200 -f
 }
 
-# -------------------------
-# APT (fast + forced freshness)
-# -------------------------
-apt_prepare_fast() {
-  export DEBIAN_FRONTEND=noninteractive
-  log "Clearing APT caches (forced, every run)..."
-  apt-get clean -y >/dev/null 2>&1 || true
-  rm -rf /var/lib/apt/lists/* || true
-  rm -rf /var/cache/apt/archives/* || true
-  log "Refreshing package lists (apt-get update)..."
-  retry apt-get update -y
+restart_server(){
+  compose restart
+  green "[+] Restart requested."
 }
 
-apt_install_min() {
-  export DEBIAN_FRONTEND=noninteractive
-  retry apt-get install -y --no-install-recommends "$@"
+update_image(){
+  yellow "[!] Pulling latest image and recreating..."
+  compose pull
+  compose up -d
+  green "[+] Updated."
 }
 
 # -------------------------
-# Self-update installer (forced fresh)
+# User management
 # -------------------------
-self_update_from_github() {
-  [[ "${1:-}" == "--no-self-update" ]] && return 0
+add_user(){
+  read -rp "Enter username: " u
+  [[ -n "${u}" ]] || { red "Username cannot be empty."; return 1; }
 
-  local tmp="/tmp/${APP_NAME}-Install-FKTN.latest.sh"
-  log "Fetching latest installer from GitHub (forced fresh)..."
-  if retry curl -fsS -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${INSTALLER_RAW_URL}" -o "${tmp}"; then
-    chmod +x "${tmp}"
-    log "Re-executing the latest installer from GitHub..."
-    exec bash "${tmp}" --no-self-update
+  read -rp "Bandwidth limit (Mbps) [default 100]: " bw
+  bw="${bw:-100}"
+
+  echo
+  yellow "[!] If prompted for password, enter a strong password."
+  # Best-effort: If fptn-passwd exists, use it. If not, guide user.
+  if compose exec -T fptn-server sh -c "command -v fptn-passwd >/dev/null 2>&1"; then
+    compose exec fptn-server fptn-passwd --add-user "${u}" --bandwidth "${bw}"
+    green "[+] User added (if no errors above)."
   else
-    warn "Could not fetch latest installer from GitHub. Continuing with local script."
+    red "[x] fptn-passwd not found inside container. This image may use a different user command."
+    red "    Check container docs or exec into container to manage users."
+    return 1
+  fi
+}
+
+gen_token(){
+  local u p ip port
+  read -rp "Username: " u
+  [[ -n "${u}" ]] || { red "Username cannot be empty."; return 1; }
+  read -rsp "Password: " p; echo
+  ip="$(public_ip)"; port="$(public_port)"
+
+  echo
+  yellow "[*] Generating token..."
+  # Best-effort: token-generator (based on previous assumptions)
+  if compose run --rm fptn-server sh -c "command -v token-generator >/dev/null 2>&1"; then
+    compose run --rm fptn-server token-generator --user "${u}" --password "${p}" --server-ip "${ip}" --port "${port}"
+    green "[+] Done."
+  else
+    red "[x] token-generator not found inside container."
+    red "    You may need to use the image's official client/token method."
+    return 1
   fi
 }
 
 # -------------------------
-# Network helpers
+# Domain + SSL
+# Strategy:
+#  - Preferred: Let's Encrypt using certbot standalone on :80
+#  - If port 80 busy:
+#      * attempt to stop nginx/apache if detected
+#      * retry certbot
+#      * if still fails -> fallback self-signed (do not crash)
+#  - Install cert into FKTN data volume as server.key/server.crt
 # -------------------------
-detect_public_ipv4() {
-  local ip=""
-  ip="$(curl -fsS4 --max-time 8 https://api.ipify.org || true)"
-  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  echo "${ip}"
-}
-
-port_in_use() {
-  local p="$1"
-  ss -ltnH "sport = :${p}" 2>/dev/null | grep -q .
-}
-
-pick_port_safe() {
-  local preferred=443
-  if ! port_in_use "${preferred}"; then echo "${preferred}"; return 0; fi
-  for p in 8443 9443 10443 11443 12443; do
-    if ! port_in_use "${p}"; then echo "${p}"; return 0; fi
-  done
-  local i p
-  for i in {1..50}; do
-    p=$(( (RANDOM % 20001) + 20000 ))
-    if ! port_in_use "${p}"; then echo "${p}"; return 0; fi
-  done
-  echo "443"
-}
-
-# -------------------------
-# TUN check
-# -------------------------
-ensure_tun() {
-  if [[ ! -c /dev/net/tun ]]; then
-    warn "/dev/net/tun not found. Attempting modprobe tun..."
-    modprobe tun >/dev/null 2>&1 || true
+ensure_pkg(){
+  local pkg="$1"
+  if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y --no-install-recommends "${pkg}"
   fi
-  [[ -c /dev/net/tun ]] || die "TUN device not available (/dev/net/tun). VPS kernel may not support it."
 }
 
-# -------------------------
-# systemd-less Docker daemon control
-# -------------------------
-systemd_usable() {
-  cmd_exists systemctl || return 1
-  systemctl list-units >/dev/null 2>&1 && return 0
-  return 1
+dns_points_to_server(){
+  local dom="$1" ip res
+  ip="$(public_ip)"
+  res="$(getent ahostsv4 "${dom}" 2>/dev/null | awk '{print $1}' | head -n1 || true)"
+  [[ -n "${res}" && "${res}" == "${ip}" ]]
 }
 
-docker_daemon_running() {
-  cmd_exists docker || return 1
-  docker info >/dev/null 2>&1
+write_tls_state(){
+  echo "$1" > "${CERT_STATE}"
 }
 
-start_docker_daemon_best_effort() {
-  cmd_exists docker || return 1
-  docker_daemon_running && return 0
+install_cert_into_fktn(){
+  local dom="$1"
+  local src_crt="/etc/letsencrypt/live/${dom}/fullchain.pem"
+  local src_key="/etc/letsencrypt/live/${dom}/privkey.pem"
 
-  if systemd_usable; then
-    systemctl enable --now docker >/dev/null 2>&1 || true
+  [[ -f "${src_crt}" && -f "${src_key}" ]] || die "Cert files not found for ${dom}."
+
+  mkdir -p "${DATA_DIR}"
+  install -m 600 "${src_key}" "${DATA_DIR}/server.key.tmp"
+  install -m 644 "${src_crt}" "${DATA_DIR}/server.crt.tmp"
+  mv -f "${DATA_DIR}/server.key.tmp" "${DATA_DIR}/server.key"
+  mv -f "${DATA_DIR}/server.crt.tmp" "${DATA_DIR}/server.crt"
+}
+
+gen_self_signed_for_domain(){
+  local dom="$1"
+  ensure_pkg openssl
+  mkdir -p "${DATA_DIR}"
+  openssl genrsa -out "${DATA_DIR}/server.key" 2048 >/dev/null 2>&1 || true
+  openssl req -new -x509 -key "${DATA_DIR}/server.key" -out "${DATA_DIR}/server.crt" -days 3650 \
+    -subj "/C=IR/ST=Tehran/L=Tehran/O=Iranux/OU=FKTN/CN=${dom}" >/dev/null 2>&1 || true
+}
+
+stop_conflicting_web_servers_best_effort(){
+  local stopped=0
+
+  # systemd path
+  if command -v systemctl >/dev/null 2>&1; then
+    for svc in nginx apache2 caddy lighttpd; do
+      if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        yellow "[!] Stopping conflicting service: ${svc}"
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+        stopped=1
+      fi
+    done
+  fi
+
+  # service command path
+  if command -v service >/dev/null 2>&1; then
+    for svc in nginx apache2 caddy lighttpd; do
+      if service "$svc" status >/dev/null 2>&1; then
+        # not fully reliable, but fine as best-effort
+        yellow "[!] Attempting service stop: ${svc}"
+        service "$svc" stop >/dev/null 2>&1 || true
+        stopped=1
+      fi
+    done
+  fi
+
+  return "${stopped}"
+}
+
+port80_in_use(){
+  ss -ltnH "sport = :80" 2>/dev/null | grep -q .
+}
+
+request_letsencrypt(){
+  local dom="$1" email="$2"
+  certbot certonly \
+    --standalone \
+    -d "${dom}" \
+    --non-interactive \
+    --agree-tos \
+    -m "${email}" \
+    --preferred-challenges http
+}
+
+enable_domain_ssl(){
+  need_root
+  ensure_pkg certbot
+
+  local dom email ok=0
+  read -rp "Domain (A record must point to this server IP): " dom
+  [[ -n "${dom}" ]] || { red "Domain cannot be empty"; return 1; }
+  read -rp "Email for Let's Encrypt (required): " email
+  [[ -n "${email}" ]] || { red "Email cannot be empty"; return 1; }
+
+  echo "${dom}" > "${DOMAIN_STATE}"
+
+  echo
+  yellow "[*] DNS pre-check..."
+  if ! dns_points_to_server "${dom}"; then
+    red "[x] DNS for ${dom} does NOT resolve to this server IP ($(public_ip))."
+    red "    Fix A record, wait propagation, then retry."
+    return 1
+  fi
+  green "[+] DNS OK."
+
+  # If port 80 is occupied, try stopping known web servers
+  if port80_in_use; then
+    yellow "[!] Port 80 is in use. Attempting to stop common conflicting services..."
+    stop_conflicting_web_servers_best_effort >/dev/null 2>&1 || true
     sleep 1
-    docker_daemon_running && return 0
   fi
 
-  if cmd_exists service; then
-    service docker start >/dev/null 2>&1 || true
-    sleep 1
-    docker_daemon_running && return 0
-  fi
+  # Try LE up to 3 times
+  echo
+  yellow "[*] Requesting Let's Encrypt certificate (standalone on :80)..."
+  for i in 1 2 3; do
+    if ! port80_in_use; then
+      if request_letsencrypt "${dom}" "${email}"; then
+        ok=1
+        break
+      fi
+    else
+      yellow "[!] Port 80 still in use. Attempt ${i}/3 cannot proceed."
+    fi
+    yellow "[!] Attempt ${i}/3 failed. Retrying..."
+    sleep 2
+  done
 
-  mkdir -p /var/run || true
-  nohup /usr/sbin/dockerd >/var/log/dockerd.log 2>&1 & disown || true
-  sleep 2
-  docker_daemon_running && return 0
-
-  return 1
-}
-
-ensure_dockerd_persistence_if_no_systemd() {
-  systemd_usable && return 0
-  cmd_exists crontab || return 0
-  local line='@reboot /usr/sbin/dockerd >/var/log/dockerd.log 2>&1 &'
-  if crontab -l 2>/dev/null | grep -Fq "$line"; then
+  if [[ "${ok}" -ne 1 ]]; then
+    red "[x] Let's Encrypt failed or port 80 could not be freed."
+    yellow "[!] Falling back to self-signed cert (server will still work)."
+    gen_self_signed_for_domain "${dom}"
+    compose restart
+    write_tls_state "TLS: self-signed for ${dom} (fallback)"
+    green "[+] Fallback TLS applied."
     return 0
   fi
-  log "Systemd not usable. Adding cron @reboot to start dockerd..."
-  (crontab -l 2>/dev/null; echo "$line") | crontab -
-}
 
-# -------------------------
-# Docker official repo fallback
-# -------------------------
-docker_repo_install() {
-  log "Configuring Docker official APT repository (for docker-compose-plugin)..."
-  apt_install_min ca-certificates curl gnupg lsb-release
+  # Install cert into FKTN volume and restart
+  install_cert_into_fktn "${dom}"
+  compose restart
 
-  install -m 0755 -d /etc/apt/keyrings
-  if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-  fi
+  # Write TLS state with expiry
+  local exp
+  exp="$(openssl x509 -in "/etc/letsencrypt/live/${dom}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d'=' -f2 || true)"
+  write_tls_state "TLS: Let's Encrypt for ${dom} (expires: ${exp:-unknown})"
 
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  local codename="${VERSION_CODENAME:-}"
-  if [[ -z "${codename}" ]] && cmd_exists lsb_release; then
-    codename="$(lsb_release -cs 2>/dev/null || true)"
-  fi
-  [[ -n "${codename}" ]] || die "Cannot detect Ubuntu codename for Docker repo."
-
-  cat > /etc/apt/sources.list.d/docker.list <<EOF
-deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable
-EOF
-
-  apt_prepare_fast
-  apt_install_min docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-}
-
-ensure_docker() {
-  # Install prerequisites early
-  apt_install_min curl ca-certificates gnupg lsb-release iproute2
-
-  if cmd_exists docker && docker --version >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    log "Docker and Docker Compose are already installed."
-  else
-    if ! cmd_exists docker; then
-      log "Installing Docker (docker.io) from Ubuntu repos..."
-      apt_install_min docker.io || true
-    fi
-
-    # Enable universe best-effort
-    if ! cmd_exists add-apt-repository; then
-      apt_install_min software-properties-common >/dev/null 2>&1 || true
-    fi
-    cmd_exists add-apt-repository && add-apt-repository -y universe >/dev/null 2>&1 || true
-
-    apt_prepare_fast
-
-    # Compose plugin attempt (Ubuntu repos)
-    if ! (cmd_exists docker && docker compose version >/dev/null 2>&1); then
-      log "Attempting to install docker-compose-plugin from Ubuntu repos..."
-      if ! apt_install_min docker-compose-plugin; then
-        warn "docker-compose-plugin not available in Ubuntu repos. Switching to Docker official repo method."
-        docker_repo_install
-      fi
-    fi
-
-    docker --version >/dev/null 2>&1 || die "Docker client installation failed."
-    docker compose version >/dev/null 2>&1 || die "Docker Compose installation failed."
-  fi
-
-  log "Starting Docker daemon..."
-  if ! start_docker_daemon_best_effort; then
-    warn "Docker daemon did not start. Last 120 lines of /var/log/dockerd.log:"
-    tail -n 120 /var/log/dockerd.log 2>/dev/null || true
-    die "Docker daemon failed to start in this environment."
-  fi
-  ensure_dockerd_persistence_if_no_systemd
-}
-
-# -------------------------
-# Targeted nuclear clean (safe)
-# -------------------------
-nuclear_clean_project() {
-  log "Nuclear clean (targeted) for ${APP_NAME}..."
-
-  # Try to stop stack only if docker daemon reachable and files exist
-  if cmd_exists docker; then
-    if ! docker_daemon_running; then
-      warn "Docker daemon not running during clean. Best-effort start..."
-      start_docker_daemon_best_effort || true
-    fi
-
-    if docker_daemon_running && [[ -f "${COMPOSE_FILE}" ]]; then
-      (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" down --remove-orphans --volumes >/dev/null 2>&1) || true
-    fi
-  fi
-
-  # Remove installed commands
-  rm -f "${SYMLINK_CAP}" "${SYMLINK_LOW}" >/dev/null 2>&1 || true
-  rm -f "${MANAGER_BIN}" >/dev/null 2>&1 || true
-
-  # Remove project directory
-  rm -rf "${BASE_DIR}" >/dev/null 2>&1 || true
-  rm -rf /tmp/${APP_NAME}-* >/dev/null 2>&1 || true
-
-  log "Clean complete."
-}
-
-# -------------------------
-# Compose deploy
-# -------------------------
-ensure_dirs() {
-  mkdir -p "${BASE_DIR}" "${DATA_DIR}" "${STATE_DIR}"
-  chmod 700 "${BASE_DIR}" || true
-}
-
-write_compose_file() {
-  cat > "${COMPOSE_FILE}" <<YAML
-services:
-  fptn-server:
-    restart: unless-stopped
-    image: ${FPTN_IMAGE}
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-      - NET_RAW
-      - SYS_ADMIN
-    sysctls:
-      - net.ipv4.ip_forward=1
-      - net.ipv6.conf.all.forwarding=1
-      - net.ipv4.conf.all.rp_filter=0
-      - net.ipv4.conf.default.rp_filter=0
-    ulimits:
-      nproc:
-        soft: 524288
-        hard: 524288
-      nofile:
-        soft: 524288
-        hard: 524288
-      memlock:
-        soft: 524288
-        hard: 524288
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    ports:
-      - "\${FPTN_PORT}:443/tcp"
-    volumes:
-      - ./fptn-server-data:/etc/fptn
-YAML
-  [[ -s "${COMPOSE_FILE}" ]] || die "Failed to write ${COMPOSE_FILE}"
-}
-
-write_env_file() {
-  local port="$1" pubip="$2"
-  local prom_key
-  prom_key="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
-
-  cat > "${ENV_FILE}" <<EOF
-FPTN_PORT=${port}
-SERVER_EXTERNAL_IPS=${pubip}
-
-# Safe defaults (can be tuned later in menu)
-ENABLE_DETECT_PROBING=true
-DEFAULT_PROXY_DOMAIN=cdnvideo.com
-DISABLE_BITTORRENT=true
-PROMETHEUS_SECRET_ACCESS_KEY=${prom_key}
-MAX_ACTIVE_SESSIONS_PER_USER=3
-EOF
-
-  [[ -s "${ENV_FILE}" ]] || die "Failed to write ${ENV_FILE}"
-}
-
-compose_up() {
-  log "Starting container..."
-  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" up -d)
-}
-
-# -------------------------
-# Install management panel from GitHub (forced fresh)
-# -------------------------
-install_manager_panel_from_github() {
-  local tmp="/tmp/${APP_NAME}-menu.latest.sh"
-  log "Fetching latest Iranux management panel (forced fresh)..."
-
-  if retry curl -fsS -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${MENU_RAW_URL}" -o "${tmp}"; then
-    chmod +x "${tmp}"
-    install -m 0755 "${tmp}" "${MANAGER_BIN}"
-    ln -sf "${MANAGER_BIN}" "${SYMLINK_CAP}"
-    ln -sf "${MANAGER_BIN}" "${SYMLINK_LOW}"
-  else
-    die "Could not fetch Iranux management panel from GitHub (${MENU_RAW_URL})."
-  fi
-}
-
-# -------------------------
-# Main install
-# -------------------------
-install_main() {
-  detect_ubuntu
-  ensure_internet
-
-  apt_prepare_fast
-  apt_install_min curl ca-certificates gnupg lsb-release iproute2 openssl git ss
-
-  ensure_tun
-  ensure_dirs
-  ensure_docker
-
-  log "Detecting public IPv4..."
-  local pub_ip
-  pub_ip="$(detect_public_ipv4)" || die "Could not auto-detect public IPv4."
-  log "Public IP detected: ${pub_ip}"
-
-  log "Selecting external port for client connections..."
+  green "[+] SSL enabled successfully."
   local port
-  port="$(pick_port_safe)"
-  log "Selected external port for client connections: ${port}"
-
-  log "Writing docker-compose.yml and .env..."
-  write_compose_file
-  write_env_file "${port}" "${pub_ip}"
-
-  compose_up
-
-  # Install menu AFTER container is up (menu can read status immediately)
-  install_manager_panel_from_github
-
-  log "Installation completed successfully."
-  log "Run management panel: Iranux (or iranux)"
-  exec "${SYMLINK_CAP}"
+  port="$(public_port)"
+  [[ "${port}" == "443" ]] && green "[+] Use domain: ${dom}" || green "[+] Use domain: ${dom}:${port}"
 }
 
-main() {
-  need_root "$@"
-  self_update_from_github "${1:-}"
-  nuclear_clean_project
-  install_main
+renew_ssl_now(){
+  need_root
+  command -v certbot >/dev/null 2>&1 || { red "certbot not installed. Enable Domain+SSL first."; return 1; }
+
+  yellow "[*] Renewing certificates (best-effort)..."
+  certbot renew --quiet || true
+
+  local dom exp
+  dom="$(domain_get)"
+  if [[ -n "${dom}" && -f "/etc/letsencrypt/live/${dom}/fullchain.pem" ]]; then
+    exp="$(openssl x509 -in "/etc/letsencrypt/live/${dom}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d'=' -f2 || true)"
+    write_tls_state "TLS: Let's Encrypt for ${dom} (expires: ${exp:-unknown})"
+    install_cert_into_fktn "${dom}" || true
+    compose restart || true
+    green "[+] Renew attempted + service restarted."
+  else
+    yellow "[!] No LE cert found for current domain. Nothing to install."
+  fi
+}
+
+# -------------------------
+# Menu
+# -------------------------
+menu(){
+  echo
+  echo "1) Status (docker compose ps)"
+  echo "2) Add VPN user"
+  echo "3) Generate connection token"
+  echo "4) Add/Update Domain + SSL (Let's Encrypt preferred)"
+  echo "5) Renew SSL now"
+  echo "6) Tail logs (last 200)"
+  echo "7) Restart server"
+  echo "8) Update to latest image (pull + recreate)"
+  echo "0) Exit"
+  echo
+}
+
+main(){
+  need_root
+  require_install
+
+  while true; do
+    clear || true
+    banner
+    menu
+    read -rp "Select: " c
+    case "${c}" in
+      1) status ;;
+      2) add_user ;;
+      3) gen_token ;;
+      4) enable_domain_ssl ;;
+      5) renew_ssl_now ;;
+      6) tail_logs ;;
+      7) restart_server ;;
+      8) update_image ;;
+      0) echo "Bye."; exit 0 ;;
+      *) red "Invalid option." ;;
+    esac
+    pause
+  done
 }
 
 main "$@"
