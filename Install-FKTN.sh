@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================
 # Iranux FKTN - One-shot Installer + Management Panel (Iranux)
+# File name (canonical): Install-FKTN.sh
 # Target OS: Ubuntu (20.04/22.04/24.04 recommended)
 # Deploys: fptnvpn/fptn-vpn-server via Docker Compose
 #
 # Hard requirements implemented:
 # - Must run as root (auto re-exec via sudo)
-# - Targeted nuclear clean of THIS project on every run
+# - Targeted nuclear clean of THIS project on every run (safe even if Docker missing)
 # - APT caches cleared on every run (fresh metadata)
 # - Minimal OS update (NO apt upgrade) for speed/safety
 # - Always fetch latest installer from GitHub (forced fresh) and re-exec once
@@ -14,6 +15,9 @@
 # - Post-install: open Iranux menu with banner (IP/Port/Users/Domain/TLS)
 # - After install: menu can add Domain + get SSL cert (Let's Encrypt preferred)
 #   + fallback to self-signed + auto-renew + renew now
+#
+# Recommended run:
+#   curl -fsSL https://raw.githubusercontent.com/Iranux/FKTN/main/Install-FKTN.sh | sudo bash
 # ============================================================
 
 set -euo pipefail
@@ -37,8 +41,8 @@ RENEW_SCRIPT="/usr/local/sbin/${APP_NAME}-renew"
 RENEW_SERVICE="/etc/systemd/system/${APP_NAME}-renew.service"
 RENEW_TIMER="/etc/systemd/system/${APP_NAME}-renew.timer"
 
-# GitHub self-update (assumes this script is stored at repo root as install.sh)
-GITHUB_RAW_URL="https://raw.githubusercontent.com/Iranux/FKTN/main/install.sh"
+# GitHub self-update (canonical filename: Install-FKTN.sh)
+GITHUB_RAW_URL="https://raw.githubusercontent.com/Iranux/FKTN/main/Install-FKTN.sh"
 
 # Docker image
 FPTN_IMAGE="fptnvpn/fptn-vpn-server:latest"
@@ -176,12 +180,11 @@ self_update_from_github() {
     return 0
   fi
 
-  local tmp="/tmp/${APP_NAME}-install.latest.sh"
+  local tmp="/tmp/${APP_NAME}-Install-FKTN.latest.sh"
 
   log "Fetching latest installer from GitHub (forced fresh)..."
   if retry curl -fsS -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${GITHUB_RAW_URL}" -o "${tmp}"; then
     chmod +x "${tmp}"
-    # Always exec the fetched version once (guarantees 'latest' even when running from pipe)
     log "Re-executing the latest installer from GitHub..."
     exec bash "${tmp}" --no-self-update
   else
@@ -215,22 +218,27 @@ compose() {
 }
 
 # -------------------------
-# Targeted nuclear clean (THIS project only)
+# Targeted nuclear clean (THIS project only) - SAFE if Docker missing
 # -------------------------
 nuclear_clean_project() {
   log "Nuclear clean (targeted) for ${APP_NAME}..."
 
-  # Stop compose stack if exists
-  if [[ -f "${COMPOSE_FILE}" ]]; then
-    (cd "${BASE_DIR}" && docker compose down --remove-orphans --volumes >/dev/null 2>&1) || true
+  # Docker cleanup should never crash if docker not installed
+  if ! cmd_exists docker; then
+    warn "Docker not installed yet. Skipping Docker cleanup."
+  else
+    # Stop compose stack if exists
+    if [[ -f "${COMPOSE_FILE}" ]]; then
+      (cd "${BASE_DIR}" && docker compose down --remove-orphans --volumes >/dev/null 2>&1) || true
+    fi
+
+    # Remove containers created from this image (extra safety)
+    docker ps -a --format '{{.ID}} {{.Image}}' | awk -v img="${FPTN_IMAGE}" '$2==img {print $1}' | while read -r cid; do
+      [[ -n "${cid}" ]] && docker rm -f "${cid}" >/dev/null 2>&1 || true
+    done
   fi
 
-  # Remove containers created from this image (extra safety)
-  docker ps -a --format '{{.ID}} {{.Image}}' | awk -v img="${FPTN_IMAGE}" '$2==img {print $1}' | while read -r cid; do
-    [[ -n "${cid}" ]] && docker rm -f "${cid}" >/dev/null 2>&1 || true
-  done
-
-  # Disable renewal timer if present
+  # Disable renewal timer if present (safe even if not installed)
   systemctl disable --now "${APP_NAME}-renew.timer" >/dev/null 2>&1 || true
   rm -f "${RENEW_SERVICE}" "${RENEW_TIMER}" "${RENEW_SCRIPT}" >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -396,13 +404,8 @@ get_env() {
 public_ip() { get_env SERVER_EXTERNAL_IPS; }
 public_port() { get_env FPTN_PORT; }
 
-domain_get() {
-  [[ -f "${DOMAIN_STATE}" ]] && cat "${DOMAIN_STATE}" || true
-}
-
-tls_status_line() {
-  [[ -f "${CERT_STATE}" ]] && cat "${CERT_STATE}" || echo "TLS: self-signed (default)"
-}
+domain_get() { [[ -f "${DOMAIN_STATE}" ]] && cat "${DOMAIN_STATE}" || true; }
+tls_status_line() { [[ -f "${CERT_STATE}" ]] && cat "${CERT_STATE}" || echo "TLS: self-signed (default)"; }
 
 endpoint_line() {
   local port dom ip
@@ -422,7 +425,6 @@ endpoint_line() {
 
 # User count: best-effort, safe
 user_count() {
-  # Some builds may support a list command; if not, fallback.
   if compose exec -T fptn-server sh -c "command -v fptn-passwd >/dev/null 2>&1" >/dev/null 2>&1; then
     local out
     out="$(compose exec -T fptn-server sh -c "fptn-passwd --list-users 2>/dev/null || true" || true)"
@@ -431,8 +433,7 @@ user_count() {
       return 0
     fi
   fi
-
-  # Heuristic fallback: count user-like artifacts if present
+  # fallback heuristic
   local out2
   out2="$(compose exec -T fptn-server sh -c "ls -1 /etc/fptn 2>/dev/null | wc -l" 2>/dev/null || true)"
   [[ -n "${out2}" ]] && echo "${out2}" || echo "unknown"
@@ -516,9 +517,8 @@ svc_owner_of_port() {
 }
 
 stop_known_conflict_service() {
-  local p="$1"
   local owner
-  owner="$(svc_owner_of_port "${p}")"
+  owner="$(svc_owner_of_port 80)"
   if [[ "${owner}" == "nginx" ]]; then
     systemctl stop nginx >/dev/null 2>&1 || true
     echo "nginx"
@@ -594,10 +594,8 @@ elif [[ "${o}" == "apache2" ]]; then
   stopped="apache2"
 fi
 
-# Attempt renew (quiet). If renew succeeds and deploy-hook runs, it restarts FKTN.
 certbot renew --quiet
 
-# Restore service if we stopped it
 if [[ -n "${stopped}" ]]; then
   systemctl start "${stopped}" >/dev/null 2>&1 || true
 fi
@@ -656,7 +654,7 @@ install_domain_ssl() {
   # Ensure port 80 free (self-healing)
   if ss -ltn "( sport = :80 )" | grep -q ":80"; then
     echo "[!] Port 80 is in use. Attempting self-heal..."
-    stopped="$(stop_known_conflict_service 80)"
+    stopped="$(stop_known_conflict_service)"
     if ss -ltn "( sport = :80 )" | grep -q ":80"; then
       echo "[x] Could not free port 80 automatically (unknown/high-risk service)."
       echo "    Fallback: self-signed cert for domain (encrypted, may warn)."
@@ -725,7 +723,7 @@ renew_now() {
   fi
   "/usr/local/sbin/${APP_NAME}-renew" || true
 
-  # If a domain exists, refresh expiry info in banner
+  # refresh expiry in banner if possible
   if [[ -f "${DOMAIN_STATE}" ]]; then
     local dom exp
     dom="$(cat "${DOMAIN_STATE}" 2>/dev/null || true)"
@@ -849,22 +847,14 @@ install_main() {
   port="$(pick_port)"
   log "Selected external port for client connections: ${port}"
 
-  # Write compose + env
   write_compose_file
   write_env_file "${port}" "${pub_ip}"
 
-  # Firewall help (only if UFW active)
   ufw_allow_if_active "${port}"
-  # Port 80 is only needed if user enables Let's Encrypt later
   ufw_allow_if_active 80
 
-  # Start container
   compose_up
-
-  # Ensure TLS exists initially (so service always works)
   ensure_initial_self_signed
-
-  # Install management panel
   write_manager_panel
 
   log "Installation completed successfully."
@@ -882,7 +872,7 @@ main() {
   # Always self-update first (ensures latest from GitHub)
   self_update_from_github "${1:-}"
 
-  # Always targeted nuclear clean before install
+  # Always targeted nuclear clean before install (safe if docker missing)
   nuclear_clean_project
 
   # Fresh install
