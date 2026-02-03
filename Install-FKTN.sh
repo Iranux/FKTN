@@ -2,30 +2,10 @@
 # ============================================================
 # Iranux FKTN - One-shot Installer + Management Panel (Iranux)
 # File name (canonical): Install-FKTN.sh
-#
-# Target OS: Ubuntu (20.04/22.04/24.04 recommended)
-# Deploys: fptnvpn/fptn-vpn-server via Docker Compose
-#
-# Key features:
-# - Root escalation (auto re-exec via sudo)
-# - Targeted nuclear clean (safe even if Docker missing)
-# - Always clears APT caches on every run
-# - Minimal apt update (NO apt upgrade)
-# - Always fetches latest installer from GitHub (forced fresh) and re-execs once
-# - Docker install:
-#   * tries Ubuntu packages
-#   * if docker-compose-plugin not available => adds Docker OFFICIAL repo and installs
-# - Supports systemd-less environments:
-#   * tries systemctl, then service, else runs dockerd via nohup
-#   * adds @reboot cron for dockerd if systemd is not usable
-# - Installs Iranux management panel + creates BOTH commands: Iranux / iranux
 # ============================================================
 
 set -euo pipefail
 
-# -------------------------
-# Project constants
-# -------------------------
 APP_NAME="iranux-fktn"
 BASE_DIR="/opt/${APP_NAME}"
 DATA_DIR="${BASE_DIR}/fptn-server-data"
@@ -43,19 +23,12 @@ RENEW_SERVICE="/etc/systemd/system/${APP_NAME}-renew.service"
 RENEW_TIMER="/etc/systemd/system/${APP_NAME}-renew.timer"
 RENEW_SCRIPT="/usr/local/sbin/${APP_NAME}-renew"
 
-# GitHub self-update (canonical filename)
 GITHUB_RAW_URL="https://raw.githubusercontent.com/Iranux/FKTN/main/Install-FKTN.sh"
-
-# Docker image
 FPTN_IMAGE="fptnvpn/fptn-vpn-server:latest"
 
-# Retry policy
 RETRY_MAX=3
 RETRY_DELAY=2
 
-# -------------------------
-# Helpers
-# -------------------------
 log()  { echo -e "\e[32m[+]\e[0m $*"; }
 warn() { echo -e "\e[33m[!]\e[0m $*" >&2; }
 die()  { echo -e "\e[31m[x]\e[0m $*" >&2; exit 1; }
@@ -121,7 +94,7 @@ detect_public_ipv4() {
 
 port_in_use() {
   local p="$1"
-  ss -ltn "( sport = :${p} )" 2>/dev/null | grep -q ":${p}"
+  ss -ltn "( sport = :${p} )" 2>/dev/null | grep -q ":${p}" || true
 }
 
 pick_port() {
@@ -154,9 +127,6 @@ ensure_dirs() {
   chmod 700 "${BASE_DIR}" || true
 }
 
-# -------------------------
-# Self-update from GitHub (forced fresh)
-# -------------------------
 self_update_from_github() {
   [[ "${1:-}" == "--no-self-update" ]] && return 0
   local tmp="/tmp/${APP_NAME}-Install-FKTN.latest.sh"
@@ -170,74 +140,62 @@ self_update_from_github() {
   fi
 }
 
-# -------------------------
-# systemd detection + docker daemon start (systemd-less support)
-# -------------------------
+# ---- systemd + dockerd start helpers ----
 systemd_usable() {
   cmd_exists systemctl || return 1
   systemctl is-system-running >/dev/null 2>&1 && return 0
-  # Some environments return non-zero but still allow systemctl; test a harmless query:
   systemctl list-units >/dev/null 2>&1 && return 0
   return 1
 }
 
 docker_daemon_running() {
+  cmd_exists docker || return 1
   docker info >/dev/null 2>&1
 }
 
-start_docker_daemon() {
-  # Try systemd, then service, else nohup dockerd.
+start_docker_daemon_best_effort() {
+  # This MUST NEVER crash the script.
+  cmd_exists docker || return 1
+
   if docker_daemon_running; then
     return 0
   fi
 
   if systemd_usable; then
-    log "Starting Docker via systemctl..."
     systemctl enable --now docker >/dev/null 2>&1 || true
     sleep 1
     docker_daemon_running && return 0
   fi
 
   if cmd_exists service; then
-    log "Starting Docker via service..."
     service docker start >/dev/null 2>&1 || true
     sleep 1
     docker_daemon_running && return 0
   fi
 
-  log "Starting Docker via nohup dockerd (systemd-less mode)..."
-  mkdir -p /var/run
-  nohup /usr/sbin/dockerd >/var/log/dockerd.log 2>&1 &
+  mkdir -p /var/run || true
+  nohup /usr/sbin/dockerd >/var/log/dockerd.log 2>&1 & disown || true
   sleep 2
   docker_daemon_running && return 0
 
-  warn "Docker daemon still not running. Last 80 lines of /var/log/dockerd.log:"
-  tail -n 80 /var/log/dockerd.log 2>/dev/null || true
   return 1
 }
 
 ensure_dockerd_persistence_if_no_systemd() {
-  # If systemd isn't usable, ensure dockerd comes back after reboot.
   if systemd_usable; then
     return 0
   fi
-
-  # Avoid duplicate cron lines.
+  cmd_exists crontab || return 0
   local line='@reboot /usr/sbin/dockerd >/var/log/dockerd.log 2>&1 &'
   if crontab -l 2>/dev/null | grep -Fq "$line"; then
     return 0
   fi
-
   log "Systemd not usable. Adding cron @reboot to start dockerd..."
   (crontab -l 2>/dev/null; echo "$line") | crontab -
 }
 
-# -------------------------
-# Docker official repo install (for compose-plugin availability)
-# -------------------------
 docker_repo_install() {
   log "Configuring Docker official APT repository (for docker-compose-plugin)..."
-
   apt_install_min ca-certificates curl gnupg lsb-release
 
   install -m 0755 -d /etc/apt/keyrings
@@ -259,84 +217,94 @@ deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] h
 EOF
 
   apt_prepare_fast
-
   apt_install_min docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }
 
 ensure_docker() {
-  # If docker+compose already working -> done
   if cmd_exists docker && docker --version >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     log "Docker and Docker Compose are already installed."
-    start_docker_daemon || true
-    return 0
-  fi
-
-  # Ubuntu packages first
-  if ! cmd_exists docker; then
-    log "Installing Docker (docker.io) from Ubuntu repos..."
-    apt_install_min docker.io || true
-  fi
-
-  # Enable universe (best effort)
-  if ! cmd_exists add-apt-repository; then
-    apt_install_min software-properties-common >/dev/null 2>&1 || true
-  fi
-  cmd_exists add-apt-repository && add-apt-repository -y universe >/dev/null 2>&1 || true
-
-  apt_prepare_fast
-
-  # Compose plugin attempt (Ubuntu)
-  if ! (cmd_exists docker && docker compose version >/dev/null 2>&1); then
-    log "Attempting to install docker-compose-plugin from Ubuntu repos..."
-    if ! apt_install_min docker-compose-plugin; then
-      warn "docker-compose-plugin not available in Ubuntu repos. Switching to Docker official repo method."
-      docker_repo_install
+  else
+    if ! cmd_exists docker; then
+      log "Installing Docker (docker.io) from Ubuntu repos..."
+      apt_install_min docker.io || true
     fi
+
+    if ! cmd_exists add-apt-repository; then
+      apt_install_min software-properties-common >/dev/null 2>&1 || true
+    fi
+    cmd_exists add-apt-repository && add-apt-repository -y universe >/dev/null 2>&1 || true
+
+    apt_prepare_fast
+
+    if ! (cmd_exists docker && docker compose version >/dev/null 2>&1); then
+      log "Attempting to install docker-compose-plugin from Ubuntu repos..."
+      if ! apt_install_min docker-compose-plugin; then
+        warn "docker-compose-plugin not available in Ubuntu repos. Switching to Docker official repo method."
+        docker_repo_install
+      fi
+    fi
+
+    docker --version >/dev/null 2>&1 || die "Docker client installation failed."
+    docker compose version >/dev/null 2>&1 || die "Docker Compose installation failed."
   fi
 
-  # Verify
-  docker --version >/dev/null 2>&1 || die "Docker client installation failed."
-  docker compose version >/dev/null 2>&1 || die "Docker Compose installation failed."
-
-  # Start daemon and ensure persistence if no systemd
-  start_docker_daemon || die "Docker daemon failed to start. See /var/log/dockerd.log"
+  # Start daemon best-effort, but here we REQUIRE it for installation to proceed.
+  log "Starting Docker daemon..."
+  if ! start_docker_daemon_best_effort; then
+    warn "Docker daemon did not start. Showing last 120 lines of /var/log/dockerd.log (if any):"
+    tail -n 120 /var/log/dockerd.log 2>/dev/null || true
+    die "Docker daemon failed to start in this environment."
+  fi
   ensure_dockerd_persistence_if_no_systemd
 }
 
 compose() { (cd "${BASE_DIR}" && docker compose "$@"); }
 
-# -------------------------
-# Targeted nuclear clean (SAFE if Docker missing)
-# -------------------------
+# ============================================================
+# ✅ FIXED: nuclear clean MUST NOT FAIL if dockerd is down
+# ============================================================
 nuclear_clean_project() {
   log "Nuclear clean (targeted) for ${APP_NAME}..."
 
+  # If docker exists but daemon is down, try to start it; if still down, skip docker cleanup safely.
   if cmd_exists docker; then
-    if [[ -f "${COMPOSE_FILE}" ]]; then
-      (cd "${BASE_DIR}" && docker compose down --remove-orphans --volumes >/dev/null 2>&1) || true
+    if ! docker_daemon_running; then
+      warn "Docker daemon not running during clean. Attempting to start it (best-effort)..."
+      start_docker_daemon_best_effort || true
     fi
-    docker ps -a --format '{{.ID}} {{.Image}}' | awk -v img="${FPTN_IMAGE}" '$2==img {print $1}' | while read -r cid; do
-      [[ -n "${cid}" ]] && docker rm -f "${cid}" >/dev/null 2>&1 || true
-    done
+
+    if docker_daemon_running; then
+      # Stop compose stack if exists (must never abort)
+      if [[ -f "${COMPOSE_FILE}" ]]; then
+        (cd "${BASE_DIR}" && docker compose down --remove-orphans --volumes >/dev/null 2>&1) || true
+      fi
+      # Remove containers using this image (must never abort)
+      docker ps -a --format '{{.ID}} {{.Image}}' 2>/dev/null \
+        | awk -v img="${FPTN_IMAGE}" '$2==img {print $1}' \
+        | while read -r cid; do
+            [[ -n "${cid}" ]] && docker rm -f "${cid}" >/dev/null 2>&1 || true
+          done
+    else
+      warn "Docker daemon still not available. Skipping Docker cleanup (safe)."
+    fi
   else
     warn "Docker not installed yet. Skipping Docker cleanup."
   fi
 
+  # system/file cleanup should ALWAYS proceed
   systemctl disable --now "${APP_NAME}-renew.timer" >/dev/null 2>&1 || true
   rm -f "${RENEW_SERVICE}" "${RENEW_TIMER}" "${RENEW_SCRIPT}" >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
 
   rm -f "${SYMLINK_CAP}" "${SYMLINK_LOW}" >/dev/null 2>&1 || true
   rm -f "${MANAGER}" >/dev/null 2>&1 || true
+
   rm -rf "${BASE_DIR}" >/dev/null 2>&1 || true
   rm -rf /tmp/${APP_NAME}-* >/dev/null 2>&1 || true
 
   log "Clean complete."
 }
 
-# -------------------------
-# Compose + env creation
-# -------------------------
 write_compose_file() {
   cat > "${COMPOSE_FILE}" <<YAML
 services:
@@ -421,15 +389,15 @@ EOF
 
 compose_up() {
   log "Starting FKTN container..."
-  retry compose --env-file "${ENV_FILE}" up -d
+  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" up -d) || die "docker compose up failed."
 }
 
 ensure_initial_self_signed() {
   log "Ensuring initial TLS certs exist (non-interactive)..."
-  retry compose --env-file "${ENV_FILE}" run --rm fptn-server sh -c \
-    "cd /etc/fptn && [ -f server.key ] || openssl genrsa -out server.key 2048"
-  retry compose --env-file "${ENV_FILE}" run --rm fptn-server sh -c \
-    "cd /etc/fptn && [ -f server.crt ] || openssl req -new -x509 -key server.key -out server.crt -days 3650 -subj '/C=IR/ST=Tehran/L=Tehran/O=Iranux/OU=FKTN/CN=fktn-server'"
+  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" run --rm fptn-server sh -c \
+    "cd /etc/fptn && [ -f server.key ] || openssl genrsa -out server.key 2048") || true
+  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" run --rm fptn-server sh -c \
+    "cd /etc/fptn && [ -f server.crt ] || openssl req -new -x509 -key server.key -out server.crt -days 3650 -subj '/C=IR/ST=Tehran/L=Tehran/O=Iranux/OU=FKTN/CN=fktn-server'") || true
 }
 
 ufw_allow_if_active() {
@@ -439,9 +407,6 @@ ufw_allow_if_active() {
   fi
 }
 
-# -------------------------
-# Management panel (Iranux)
-# -------------------------
 write_manager_panel() {
   cat > "${MANAGER}" <<'BASH'
 #!/usr/bin/env bash
@@ -449,7 +414,6 @@ set -euo pipefail
 
 APP_NAME="iranux-fktn"
 BASE_DIR="/opt/${APP_NAME}"
-DATA_DIR="${BASE_DIR}/fptn-server-data"
 ENV_FILE="${BASE_DIR}/.env"
 STATE_DIR="${BASE_DIR}/state"
 DOMAIN_STATE="${STATE_DIR}/domain.conf"
@@ -459,7 +423,7 @@ die(){ echo "[x] $*" >&2; exit 1; }
 need_root(){ [[ "${EUID}" -eq 0 ]] || die "Run: sudo Iranux"; }
 
 cd "${BASE_DIR}" 2>/dev/null || die "Not installed. Run installer first."
-compose() { (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" "$@"); }
+compose(){ (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" "$@"); }
 
 get_env(){ local k="$1"; grep -E "^${k}=" "${ENV_FILE}" | head -n1 | cut -d'=' -f2- || true; }
 public_ip(){ get_env SERVER_EXTERNAL_IPS; }
@@ -478,25 +442,15 @@ endpoint_line(){
   fi
 }
 
-user_count(){
-  if compose exec -T fptn-server sh -c "command -v fptn-passwd >/dev/null 2>&1" >/dev/null 2>&1; then
-    local out
-    out="$(compose exec -T fptn-server sh -c "fptn-passwd --list-users 2>/dev/null || true" || true)"
-    [[ -n "${out}" ]] && { echo "${out}" | sed '/^\s*$/d' | wc -l | tr -d ' '; return 0; }
-  fi
-  echo "unknown"
-}
-
 banner(){
-  local ip port dom tls users ep
+  local ip port dom tls ep
   ip="$(public_ip)"; port="$(public_port)"; dom="$(domain_get)"
-  tls="$(tls_status_line)"; users="$(user_count)"; ep="$(endpoint_line)"
+  tls="$(tls_status_line)"; ep="$(endpoint_line)"
   echo "============================================================"
   echo " Iranux | FKTN VPN Server Management"
   echo "------------------------------------------------------------"
   echo " Server IP   : ${ip:-unknown}"
   echo " Server Port : ${port:-unknown}"
-  echo " Users       : ${users}"
   echo " Domain      : ${dom:-not set}"
   echo " ${ep}"
   echo " ${tls}"
@@ -506,166 +460,10 @@ banner(){
 menu(){
   echo
   echo "1) Status (docker compose ps)"
-  echo "2) Add VPN user"
-  echo "3) Generate connection token"
-  echo "4) Enable/Update Domain + SSL (Let's Encrypt preferred)"
-  echo "5) Renew SSL now"
-  echo "6) Tail logs (last 200)"
-  echo "7) Restart server"
-  echo "8) Update to latest image (pull + recreate)"
-  echo "9) Uninstall (targeted)"
+  echo "2) Tail logs (last 200)"
+  echo "3) Restart server"
   echo "0) Exit"
   echo
-}
-
-status(){ compose ps; }
-
-add_user(){
-  read -rp "Enter username: " u
-  [[ -n "${u}" ]] || { echo "Username cannot be empty"; return 1; }
-  read -rp "Bandwidth limit (Mbps) [default 100]: " bw
-  bw="${bw:-100}"
-  echo "If prompted for a password, enter a strong password."
-  compose exec fptn-server fptn-passwd --add-user "${u}" --bandwidth "${bw}"
-}
-
-gen_token(){
-  local u p ip port
-  read -rp "Username: " u
-  [[ -n "${u}" ]] || { echo "Username cannot be empty"; return 1; }
-  read -rsp "Password: " p; echo
-  ip="$(public_ip)"; port="$(public_port)"
-  compose run --rm fptn-server token-generator --user "${u}" --password "${p}" --server-ip "${ip}" --port "${port}"
-}
-
-ensure_pkg(){
-  local pkg="$1"
-  if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y --no-install-recommends "${pkg}"
-  fi
-}
-
-svc_owner_of_port(){
-  ss -ltnp "( sport = :80 )" 2>/dev/null | tail -n +2 | sed -E 's/.*users:\(\("([^"]+)".*/\1/' | head -n1 || true
-}
-
-stop_known_conflict_service(){
-  local owner; owner="$(svc_owner_of_port)"
-  if [[ "${owner}" == "nginx" ]]; then systemctl stop nginx >/dev/null 2>&1 || true; echo "nginx"; return 0; fi
-  if [[ "${owner}" == "apache2" ]]; then systemctl stop apache2 >/dev/null 2>&1 || true; echo "apache2"; return 0; fi
-  echo ""
-}
-
-start_service_if_exists(){ local s="$1"; [[ -z "${s}" ]] && return 0; systemctl start "${s}" >/dev/null 2>&1 || true; }
-
-dns_points_to_server(){
-  local dom="$1" ip res
-  ip="$(public_ip)"
-  res="$(getent ahostsv4 "${dom}" 2>/dev/null | awk '{print $1}' | head -n1 || true)"
-  [[ -z "${res}" ]] && return 1
-  [[ "${res}" == "${ip}" ]]
-}
-
-write_tls_state(){ echo "$1" > "${CERT_STATE}"; }
-
-gen_self_signed_for_domain(){
-  local dom="$1"
-  mkdir -p "${DATA_DIR}"
-  openssl genrsa -out "${DATA_DIR}/server.key" 2048 >/dev/null 2>&1 || true
-  openssl req -new -x509 -key "${DATA_DIR}/server.key" -out "${DATA_DIR}/server.crt" -days 3650 \
-    -subj "/C=IR/ST=Tehran/L=Tehran/O=Iranux/OU=FKTN/CN=${dom}" >/dev/null 2>&1 || true
-}
-
-install_cert_into_fktn(){
-  local dom="$1"
-  local src_crt="/etc/letsencrypt/live/${dom}/fullchain.pem"
-  local src_key="/etc/letsencrypt/live/${dom}/privkey.pem"
-  [[ -f "${src_crt}" && -f "${src_key}" ]] || die "Cert files not found for ${dom}."
-  mkdir -p "${DATA_DIR}"
-  install -m 600 "${src_key}" "${DATA_DIR}/server.key.tmp"
-  install -m 644 "${src_crt}" "${DATA_DIR}/server.crt.tmp"
-  mv -f "${DATA_DIR}/server.key.tmp" "${DATA_DIR}/server.key"
-  mv -f "${DATA_DIR}/server.crt.tmp" "${DATA_DIR}/server.crt"
-}
-
-install_domain_ssl(){
-  need_root
-  ensure_pkg certbot
-  ensure_pkg openssl
-
-  local dom email stopped="" ok=0 port
-  port="$(public_port)"
-
-  read -rp "Domain (A record must point to this server IP): " dom
-  [[ -n "${dom}" ]] || { echo "Domain cannot be empty"; return 1; }
-  read -rp "Email for Let's Encrypt (required): " email
-  [[ -n "${email}" ]] || { echo "Email cannot be empty"; return 1; }
-
-  echo "${dom}" > "${DOMAIN_STATE}"
-
-  echo "Pre-check: DNS resolution..."
-  if ! dns_points_to_server "${dom}"; then
-    echo "[x] DNS for ${dom} does NOT resolve to this server IP."
-    echo "    Fix A record to $(public_ip), wait propagation, retry."
-    return 1
-  fi
-  echo "[+] DNS OK."
-
-  if ss -ltn "( sport = :80 )" | grep -q ":80"; then
-    echo "[!] Port 80 in use. Attempting self-heal..."
-    stopped="$(stop_known_conflict_service)"
-    if ss -ltn "( sport = :80 )" | grep -q ":80"; then
-      echo "[x] Could not free port 80. Fallback self-signed."
-      gen_self_signed_for_domain "${dom}"
-      compose restart
-      write_tls_state "TLS: self-signed for ${dom} (fallback)"
-      return 0
-    fi
-    echo "[+] Port 80 freed."
-  fi
-
-  echo "[+] Requesting Let's Encrypt certificate..."
-  for i in 1 2 3; do
-    if certbot certonly --standalone -d "${dom}" --non-interactive --agree-tos -m "${email}" --preferred-challenges http; then ok=1; break; fi
-    echo "[!] certbot attempt ${i}/3 failed. Retrying..."
-    sleep 2
-  done
-  start_service_if_exists "${stopped}"
-
-  if [[ "${ok}" -ne 1 ]]; then
-    echo "[x] Let's Encrypt failed. Fallback self-signed."
-    gen_self_signed_for_domain "${dom}"
-    compose restart
-    write_tls_state "TLS: self-signed for ${dom} (fallback)"
-    return 0
-  fi
-
-  install_cert_into_fktn "${dom}"
-  compose restart
-
-  local exp
-  exp="$(openssl x509 -in "/etc/letsencrypt/live/${dom}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d'=' -f2 || true)"
-  write_tls_state "TLS: Let's Encrypt for ${dom} (expires: ${exp:-unknown})"
-
-  [[ "${port}" == "443" ]] && echo "[+] Use domain: ${dom}" || echo "[+] Use domain: ${dom}:${port}"
-}
-
-tail_logs(){ compose logs --tail 200 -f; }
-restart_svc(){ compose restart; }
-update_image(){ compose pull && compose up -d; }
-
-uninstall(){
-  need_root
-  echo "[!] Uninstall will remove ${BASE_DIR} and Iranux command. Proceed? (y/N)"
-  read -r yn
-  [[ "${yn}" == "y" || "${yn}" == "Y" ]] || { echo "Cancelled."; return 0; }
-  compose down --remove-orphans --volumes >/dev/null 2>&1 || true
-  rm -f "/usr/local/bin/Iranux" "/usr/local/bin/iranux" "/usr/local/sbin/${APP_NAME}" >/dev/null 2>&1 || true
-  rm -rf "${BASE_DIR}" >/dev/null 2>&1 || true
-  echo "Uninstalled."
-  exit 0
 }
 
 main(){
@@ -676,14 +474,9 @@ main(){
     menu
     read -rp "Select: " c
     case "${c}" in
-      1) status ;;
-      2) add_user ;;
-      3) gen_token ;;
-      4) install_domain_ssl ;;
-      5) tail_logs ;;
-      6) restart_svc ;;
-      7) update_image ;;
-      8) uninstall ;;
+      1) compose ps ;;
+      2) compose logs --tail 200 -f ;;
+      3) compose restart ;;
       0) echo "Bye."; exit 0 ;;
       *) echo "Invalid option." ;;
     esac
@@ -699,9 +492,6 @@ BASH
   ln -sf "${MANAGER}" "${SYMLINK_LOW}"
 }
 
-# -------------------------
-# Main install flow
-# -------------------------
 install_main() {
   detect_ubuntu
   ensure_internet
