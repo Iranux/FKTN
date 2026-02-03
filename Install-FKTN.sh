@@ -5,13 +5,21 @@
 # Target OS: Ubuntu (20.04/22.04/24.04 recommended)
 # Deploys: fptnvpn/fptn-vpn-server via Docker Compose
 #
+# FIXES INCLUDED (based on your latest test):
+# - docker-compose-plugin missing in Ubuntu repos:
+#   -> auto-enables 'universe'
+#   -> if still missing, auto-adds Docker OFFICIAL repo and installs:
+#      docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin
+# - nuclear clean is SAFE if docker not installed
+# - all self-update URLs use Install-FKTN.sh
+#
 # Hard requirements implemented:
 # - Must run as root (auto re-exec via sudo)
-# - Targeted nuclear clean of THIS project on every run (safe even if Docker missing)
+# - Targeted nuclear clean of THIS project on every run
 # - APT caches cleared on every run (fresh metadata)
-# - Minimal OS update (NO apt upgrade) for speed/safety
+# - Minimal OS update (NO apt upgrade)
 # - Always fetch latest installer from GitHub (forced fresh) and re-exec once
-# - Self-healing: tries to fix common issues before surfacing errors
+# - Self-healing behavior for common issues
 # - Post-install: open Iranux menu with banner (IP/Port/Users/Domain/TLS)
 # - After install: menu can add Domain + get SSL cert (Let's Encrypt preferred)
 #   + fallback to self-signed + auto-renew + renew now
@@ -193,24 +201,88 @@ self_update_from_github() {
 }
 
 # -------------------------
-# Docker install (minimal + robust)
+# Docker official repo install (for compose-plugin availability)
+# -------------------------
+docker_repo_install() {
+  # Adds Docker official repo and installs compose plugin
+  # Safe to re-run.
+  log "Configuring Docker official APT repository (for docker-compose-plugin availability)..."
+
+  apt_install_min ca-certificates curl gnupg lsb-release
+
+  install -m 0755 -d /etc/apt/keyrings
+  if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  fi
+
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  local codename="${VERSION_CODENAME:-}"
+  if [[ -z "${codename}" ]]; then
+    codename="$(lsb_release -cs 2>/dev/null || true)"
+  fi
+  [[ -n "${codename}" ]] || die "Cannot detect Ubuntu codename for Docker repo."
+
+  cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable
+EOF
+
+  apt_prepare_fast
+
+  # Install Docker + Compose plugin from official repo
+  apt_install_min docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  systemctl enable --now docker >/dev/null 2>&1 || true
+}
+
+# -------------------------
+# Docker install (minimal + robust + self-healing)
 # -------------------------
 ensure_docker() {
+  # 0) If docker exists and compose works => done
   if cmd_exists docker && docker --version >/dev/null 2>&1; then
     log "Docker is installed."
-  else
+  fi
+
+  if cmd_exists docker && docker compose version >/dev/null 2>&1; then
+    log "Docker Compose plugin is available."
+    return 0
+  fi
+
+  # 1) Try Ubuntu packages first (fastest)
+  if ! cmd_exists docker; then
     log "Installing Docker (docker.io)..."
-    apt_install_min docker.io
+    apt_install_min docker.io || true
     systemctl enable --now docker >/dev/null 2>&1 || true
   fi
 
-  if docker compose version >/dev/null 2>&1; then
-    log "Docker Compose plugin is available."
+  # 2) Ensure universe enabled (some packages live there)
+  if cmd_exists add-apt-repository; then
+    add-apt-repository -y universe >/dev/null 2>&1 || true
   else
-    log "Installing Docker Compose plugin..."
-    apt_install_min docker-compose-plugin
-    docker compose version >/dev/null 2>&1 || die "Docker Compose plugin install failed."
+    # On minimal images, software-properties-common may be missing
+    apt_install_min software-properties-common >/dev/null 2>&1 || true
+    cmd_exists add-apt-repository && add-apt-repository -y universe >/dev/null 2>&1 || true
   fi
+
+  # refresh lists after enabling universe
+  apt_prepare_fast
+
+  # 3) Try install compose plugin from Ubuntu repos
+  if ! docker compose version >/dev/null 2>&1; then
+    log "Attempting to install docker-compose-plugin from Ubuntu repos..."
+    if apt_install_min docker-compose-plugin; then
+      log "docker-compose-plugin installed from Ubuntu repos."
+    else
+      warn "docker-compose-plugin not available in Ubuntu repos. Switching to Docker official repo method."
+      docker_repo_install
+    fi
+  fi
+
+  # 4) Final verification
+  docker --version >/dev/null 2>&1 || die "Docker installation failed."
+  docker compose version >/dev/null 2>&1 || die "Docker Compose installation failed."
 }
 
 compose() {
@@ -223,7 +295,6 @@ compose() {
 nuclear_clean_project() {
   log "Nuclear clean (targeted) for ${APP_NAME}..."
 
-  # Docker cleanup should never crash if docker not installed
   if ! cmd_exists docker; then
     warn "Docker not installed yet. Skipping Docker cleanup."
   else
@@ -238,19 +309,14 @@ nuclear_clean_project() {
     done
   fi
 
-  # Disable renewal timer if present (safe even if not installed)
   systemctl disable --now "${APP_NAME}-renew.timer" >/dev/null 2>&1 || true
   rm -f "${RENEW_SERVICE}" "${RENEW_TIMER}" "${RENEW_SCRIPT}" >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
 
-  # Remove Iranux command and manager
   rm -f "${SYMLINK}" >/dev/null 2>&1 || true
   rm -f "${MANAGER}" >/dev/null 2>&1 || true
 
-  # Remove project directory (fresh install policy)
   rm -rf "${BASE_DIR}" >/dev/null 2>&1 || true
-
-  # Remove temp installer downloads
   rm -rf /tmp/${APP_NAME}-* >/dev/null 2>&1 || true
 
   log "Clean complete."
@@ -260,8 +326,6 @@ nuclear_clean_project() {
 # Compose + env creation
 # -------------------------
 write_compose_file() {
-  # NOTE: We intentionally DO NOT map 80:80 to avoid conflicts.
-  # Let's Encrypt will use certbot standalone on host :80 when needed.
   cat > "${COMPOSE_FILE}" <<YAML
 services:
   fptn-server:
@@ -393,14 +457,9 @@ die(){ echo "[x] $*" >&2; exit 1; }
 need_root(){ [[ "${EUID}" -eq 0 ]] || die "Run: sudo Iranux"; }
 
 cd "${BASE_DIR}" 2>/dev/null || die "Not installed. Run installer first."
-
 compose() { (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" "$@"); }
 
-get_env() {
-  local k="$1"
-  grep -E "^${k}=" "${ENV_FILE}" | head -n1 | cut -d'=' -f2- || true
-}
-
+get_env() { local k="$1"; grep -E "^${k}=" "${ENV_FILE}" | head -n1 | cut -d'=' -f2- || true; }
 public_ip() { get_env SERVER_EXTERNAL_IPS; }
 public_port() { get_env FPTN_PORT; }
 
@@ -409,9 +468,7 @@ tls_status_line() { [[ -f "${CERT_STATE}" ]] && cat "${CERT_STATE}" || echo "TLS
 
 endpoint_line() {
   local port dom ip
-  ip="$(public_ip)"
-  port="$(public_port)"
-  dom="$(domain_get)"
+  ip="$(public_ip)"; port="$(public_port)"; dom="$(domain_get)"
   if [[ -n "${dom}" ]]; then
     if [[ "${port}" == "443" ]]; then
       echo "Endpoint: ${dom} (preferred) | Fallback: ${ip}:443"
@@ -423,7 +480,6 @@ endpoint_line() {
   fi
 }
 
-# User count: best-effort, safe
 user_count() {
   if compose exec -T fptn-server sh -c "command -v fptn-passwd >/dev/null 2>&1" >/dev/null 2>&1; then
     local out
@@ -433,7 +489,6 @@ user_count() {
       return 0
     fi
   fi
-  # fallback heuristic
   local out2
   out2="$(compose exec -T fptn-server sh -c "ls -1 /etc/fptn 2>/dev/null | wc -l" 2>/dev/null || true)"
   [[ -n "${out2}" ]] && echo "${out2}" || echo "unknown"
@@ -441,13 +496,8 @@ user_count() {
 
 banner() {
   local ip port dom tls users ep
-  ip="$(public_ip)"
-  port="$(public_port)"
-  dom="$(domain_get)"
-  tls="$(tls_status_line)"
-  users="$(user_count)"
-  ep="$(endpoint_line)"
-
+  ip="$(public_ip)"; port="$(public_port)"; dom="$(domain_get)"
+  tls="$(tls_status_line)"; users="$(user_count)"; ep="$(endpoint_line)"
   echo "============================================================"
   echo " Iranux | FKTN VPN Server Management"
   echo "------------------------------------------------------------"
@@ -495,8 +545,7 @@ gen_token() {
   read -rp "Username: " u
   [[ -n "${u}" ]] || { echo "Username cannot be empty"; return 1; }
   read -rsp "Password: " p; echo
-  ip="$(public_ip)"
-  port="$(public_port)"
+  ip="$(public_ip)"; port="$(public_port)"
   echo
   echo "Generating token (copy it into the client app):"
   compose run --rm fptn-server token-generator --user "${u}" --password "${p}" --server-ip "${ip}" --port "${port}"
@@ -512,45 +561,27 @@ ensure_pkg() {
 }
 
 svc_owner_of_port() {
-  local p="$1"
-  ss -ltnp "( sport = :${p} )" 2>/dev/null | tail -n +2 | sed -E 's/.*users:\(\("([^"]+)".*/\1/' | head -n1 || true
+  ss -ltnp "( sport = :80 )" 2>/dev/null | tail -n +2 | sed -E 's/.*users:\(\("([^"]+)".*/\1/' | head -n1 || true
 }
 
 stop_known_conflict_service() {
-  local owner
-  owner="$(svc_owner_of_port 80)"
-  if [[ "${owner}" == "nginx" ]]; then
-    systemctl stop nginx >/dev/null 2>&1 || true
-    echo "nginx"
-    return 0
-  fi
-  if [[ "${owner}" == "apache2" ]]; then
-    systemctl stop apache2 >/dev/null 2>&1 || true
-    echo "apache2"
-    return 0
-  fi
+  local owner; owner="$(svc_owner_of_port)"
+  if [[ "${owner}" == "nginx" ]]; then systemctl stop nginx >/dev/null 2>&1 || true; echo "nginx"; return 0; fi
+  if [[ "${owner}" == "apache2" ]]; then systemctl stop apache2 >/dev/null 2>&1 || true; echo "apache2"; return 0; fi
   echo ""
 }
 
-start_service_if_exists() {
-  local s="$1"
-  [[ -z "${s}" ]] && return 0
-  systemctl start "${s}" >/dev/null 2>&1 || true
-}
+start_service_if_exists() { local s="$1"; [[ -z "${s}" ]] && return 0; systemctl start "${s}" >/dev/null 2>&1 || true; }
 
 dns_points_to_server() {
-  local dom="$1"
-  local ip res
+  local dom="$1" ip res
   ip="$(public_ip)"
   res="$(getent ahostsv4 "${dom}" 2>/dev/null | awk '{print $1}' | head -n1 || true)"
   [[ -z "${res}" ]] && return 1
   [[ "${res}" == "${ip}" ]]
 }
 
-write_tls_state() {
-  local line="$1"
-  echo "${line}" > "${CERT_STATE}"
-}
+write_tls_state(){ echo "$1" > "${CERT_STATE}"; }
 
 gen_self_signed_for_domain() {
   local dom="$1"
@@ -565,7 +596,6 @@ install_cert_into_fktn() {
   local src_crt="/etc/letsencrypt/live/${dom}/fullchain.pem"
   local src_key="/etc/letsencrypt/live/${dom}/privkey.pem"
   [[ -f "${src_crt}" && -f "${src_key}" ]] || die "Cert files not found for ${dom}."
-
   mkdir -p "${DATA_DIR}"
   install -m 600 "${src_key}" "${DATA_DIR}/server.key.tmp"
   install -m 644 "${src_crt}" "${DATA_DIR}/server.crt.tmp"
@@ -577,28 +607,14 @@ setup_auto_renew() {
   cat > "/usr/local/sbin/${APP_NAME}-renew" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
-# Self-healing renew:
-# - If port 80 is blocked by nginx/apache2, stop temporarily then restore.
-owner() {
-  ss -ltnp "( sport = :80 )" 2>/dev/null | tail -n +2 | sed -E 's/.*users:\(\("([^"]+)".*/\1/' | head -n1 || true
-}
-
+owner(){ ss -ltnp "( sport = :80 )" 2>/dev/null | tail -n +2 | sed -E 's/.*users:\(\("([^"]+)".*/\1/' | head -n1 || true; }
 stopped=""
 o="$(owner)"
-if [[ "${o}" == "nginx" ]]; then
-  systemctl stop nginx >/dev/null 2>&1 || true
-  stopped="nginx"
-elif [[ "${o}" == "apache2" ]]; then
-  systemctl stop apache2 >/dev/null 2>&1 || true
-  stopped="apache2"
+if [[ "${o}" == "nginx" ]]; then systemctl stop nginx >/dev/null 2>&1 || true; stopped="nginx"
+elif [[ "${o}" == "apache2" ]]; then systemctl stop apache2 >/dev/null 2>&1 || true; stopped="apache2"
 fi
-
 certbot renew --quiet
-
-if [[ -n "${stopped}" ]]; then
-  systemctl start "${stopped}" >/dev/null 2>&1 || true
-fi
+[[ -n "${stopped}" ]] && systemctl start "${stopped}" >/dev/null 2>&1 || true
 EOF
   chmod 0755 "/usr/local/sbin/${APP_NAME}-renew"
 
@@ -632,7 +648,7 @@ install_domain_ssl() {
   ensure_pkg certbot
   ensure_pkg openssl
 
-  local dom email port stopped=""
+  local dom email port stopped="" ok=0
   port="$(public_port)"
 
   read -rp "Domain (A record must point to this server IP): " dom
@@ -651,13 +667,12 @@ install_domain_ssl() {
   fi
   echo "[+] DNS OK."
 
-  # Ensure port 80 free (self-healing)
   if ss -ltn "( sport = :80 )" | grep -q ":80"; then
     echo "[!] Port 80 is in use. Attempting self-heal..."
     stopped="$(stop_known_conflict_service)"
     if ss -ltn "( sport = :80 )" | grep -q ":80"; then
       echo "[x] Could not free port 80 automatically (unknown/high-risk service)."
-      echo "    Fallback: self-signed cert for domain (encrypted, may warn)."
+      echo "    Fallback: self-signed cert for domain."
       gen_self_signed_for_domain "${dom}"
       compose restart
       write_tls_state "TLS: self-signed for ${dom} (fallback)"
@@ -666,30 +681,25 @@ install_domain_ssl() {
     echo "[+] Port 80 freed."
   fi
 
-  # Open 80 if UFW active
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -qi "Status: active"; then
     ufw allow 80/tcp >/dev/null 2>&1 || true
   fi
 
   echo
   echo "[+] Requesting Let's Encrypt certificate (standalone on :80)..."
-
-  local ok=0
   for i in 1 2 3; do
     if certbot certonly --standalone -d "${dom}" --non-interactive --agree-tos -m "${email}" --preferred-challenges http; then
-      ok=1
-      break
+      ok=1; break
     fi
     echo "[!] certbot attempt ${i}/3 failed. Retrying..."
     sleep 2
   done
 
-  # Restore any stopped service
   start_service_if_exists "${stopped}"
 
   if [[ "${ok}" -ne 1 ]]; then
     echo "[x] Let's Encrypt issuance failed after retries."
-    echo "    Fallback: generating self-signed cert for domain."
+    echo "    Fallback: self-signed cert for domain."
     gen_self_signed_for_domain "${dom}"
     compose restart
     write_tls_state "TLS: self-signed for ${dom} (fallback)"
@@ -699,8 +709,6 @@ install_domain_ssl() {
   echo "[+] Certificate obtained. Installing into FKTN..."
   install_cert_into_fktn "${dom}"
   setup_auto_renew
-
-  # Restart FKTN to apply
   compose restart
 
   local exp
@@ -708,11 +716,7 @@ install_domain_ssl() {
   write_tls_state "TLS: Let's Encrypt for ${dom} (expires: ${exp:-unknown})"
 
   echo "[+] Done. Domain + SSL enabled."
-  if [[ "${port}" == "443" ]]; then
-    echo "    You can use: ${dom} (instead of IP)"
-  else
-    echo "    You can use: ${dom}:${port} (instead of IP)"
-  fi
+  [[ "${port}" == "443" ]] && echo "    You can use: ${dom}" || echo "    You can use: ${dom}:${port}"
 }
 
 renew_now() {
@@ -723,7 +727,6 @@ renew_now() {
   fi
   "/usr/local/sbin/${APP_NAME}-renew" || true
 
-  # refresh expiry in banner if possible
   if [[ -f "${DOMAIN_STATE}" ]]; then
     local dom exp
     dom="$(cat "${DOMAIN_STATE}" 2>/dev/null || true)"
@@ -732,7 +735,6 @@ renew_now() {
       write_tls_state "TLS: Let's Encrypt for ${dom} (expires: ${exp:-unknown})"
     fi
   fi
-
   echo "Renew attempted."
 }
 
@@ -769,9 +771,9 @@ restore_backup() {
   echo "Restore complete."
 }
 
-tail_logs() { compose logs --tail 200 -f; }
-restart_svc() { compose restart; }
-update_image() { compose pull && compose up -d; }
+tail_logs(){ compose logs --tail 200 -f; }
+restart_svc(){ compose restart; }
+update_image(){ compose pull && compose up -d; }
 
 uninstall() {
   need_root
@@ -814,7 +816,6 @@ main() {
     read -rp "Press Enter to continue..." _ || true
   done
 }
-
 main "$@"
 BASH
 
