@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================
-# Iranux FKTN - One-shot Installer + Management Panel (Iranux)
-# File name (canonical): Install-FKTN.sh
+# Iranux FKTN - Installer + Iranux Management
+# Canonical file: Install-FKTN.sh
 # ============================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 
 APP_NAME="iranux-fktn"
 BASE_DIR="/opt/${APP_NAME}"
@@ -12,16 +12,10 @@ DATA_DIR="${BASE_DIR}/fptn-server-data"
 COMPOSE_FILE="${BASE_DIR}/docker-compose.yml"
 ENV_FILE="${BASE_DIR}/.env"
 STATE_DIR="${BASE_DIR}/state"
-DOMAIN_STATE="${STATE_DIR}/domain.conf"
-CERT_STATE="${STATE_DIR}/cert.conf"
 
 MANAGER="/usr/local/sbin/${APP_NAME}"
 SYMLINK_CAP="/usr/local/bin/Iranux"
 SYMLINK_LOW="/usr/local/bin/iranux"
-
-RENEW_SERVICE="/etc/systemd/system/${APP_NAME}-renew.service"
-RENEW_TIMER="/etc/systemd/system/${APP_NAME}-renew.timer"
-RENEW_SCRIPT="/usr/local/sbin/${APP_NAME}-renew"
 
 GITHUB_RAW_URL="https://raw.githubusercontent.com/Iranux/FKTN/main/Install-FKTN.sh"
 FPTN_IMAGE="fptnvpn/fptn-vpn-server:latest"
@@ -32,6 +26,21 @@ RETRY_DELAY=2
 log()  { echo -e "\e[32m[+]\e[0m $*"; }
 warn() { echo -e "\e[33m[!]\e[0m $*" >&2; }
 die()  { echo -e "\e[31m[x]\e[0m $*" >&2; exit 1; }
+
+on_err() {
+  local exit_code=$?
+  warn "Installer failed."
+  warn "Line: ${BASH_LINENO[0]} | Command: ${BASH_COMMAND}"
+  warn "Exit code: ${exit_code}"
+  # Show helpful context if dockerd is relevant
+  if command -v docker >/dev/null 2>&1; then
+    if ! docker info >/dev/null 2>&1; then
+      warn "Docker daemon not reachable at failure time."
+    fi
+  fi
+  exit "${exit_code}"
+}
+trap on_err ERR
 
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
@@ -62,7 +71,7 @@ detect_ubuntu() {
   [[ -f /etc/os-release ]] || die "Cannot detect OS. /etc/os-release missing."
   # shellcheck disable=SC1091
   source /etc/os-release
-  [[ "${ID:-}" == "ubuntu" ]] || die "Unsupported OS: ${ID:-unknown}. This installer supports Ubuntu."
+  [[ "${ID:-}" == "ubuntu" ]] || die "Unsupported OS: ${ID:-unknown}. Ubuntu only."
 }
 
 ensure_internet() {
@@ -85,33 +94,17 @@ apt_install_min() {
   retry apt-get install -y --no-install-recommends "$@"
 }
 
-detect_public_ipv4() {
-  local ip=""
-  ip="$(curl -fsS4 --max-time 8 https://api.ipify.org || true)"
-  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  echo "${ip}"
-}
-
-port_in_use() {
-  local p="$1"
-  ss -ltn "( sport = :${p} )" 2>/dev/null | grep -q ":${p}" || true
-}
-
-pick_port() {
-  local preferred=443
-  if ! port_in_use "${preferred}"; then echo "${preferred}"; return 0; fi
-  for p in 8443 9443 10443 11443 12443; do
-    if ! port_in_use "${p}"; then echo "${p}"; return 0; fi
-  done
-  while true; do
-    p=$(( (RANDOM % 20001) + 20000 ))
-    if ! port_in_use "${p}"; then echo "${p}"; return 0; fi
-  done
-}
-
-random_alnum() {
-  local n="${1:-32}"
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${n}"
+self_update_from_github() {
+  [[ "${1:-}" == "--no-self-update" ]] && return 0
+  local tmp="/tmp/${APP_NAME}-Install-FKTN.latest.sh"
+  log "Fetching latest installer from GitHub (forced fresh)..."
+  if retry curl -fsS -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${GITHUB_RAW_URL}" -o "${tmp}"; then
+    chmod +x "${tmp}"
+    log "Re-executing the latest installer from GitHub..."
+    exec bash "${tmp}" --no-self-update
+  else
+    warn "Could not fetch latest installer from GitHub. Continuing with local script."
+  fi
 }
 
 ensure_tun() {
@@ -127,23 +120,48 @@ ensure_dirs() {
   chmod 700 "${BASE_DIR}" || true
 }
 
-self_update_from_github() {
-  [[ "${1:-}" == "--no-self-update" ]] && return 0
-  local tmp="/tmp/${APP_NAME}-Install-FKTN.latest.sh"
-  log "Fetching latest installer from GitHub (forced fresh)..."
-  if retry curl -fsS -H "Cache-Control: no-cache" -H "Pragma: no-cache" "${GITHUB_RAW_URL}" -o "${tmp}"; then
-    chmod +x "${tmp}"
-    log "Re-executing the latest installer from GitHub..."
-    exec bash "${tmp}" --no-self-update
-  else
-    warn "Could not fetch latest installer from GitHub. Continuing with local script."
-  fi
+detect_public_ipv4() {
+  local ip=""
+  ip="$(curl -fsS4 --max-time 8 https://api.ipify.org || true)"
+  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  echo "${ip}"
 }
 
-# ---- systemd + dockerd start helpers ----
+# ---- safer port detection (no silent stop, no loops) ----
+port_in_use() {
+  local p="$1"
+  # Return 0 only if there is at least one LISTEN socket on that port
+  ss -ltnH "sport = :${p}" 2>/dev/null | grep -q .
+}
+
+pick_port_safe() {
+  local preferred=443
+  if ! port_in_use "${preferred}"; then
+    echo "${preferred}"
+    return 0
+  fi
+  for p in 8443 9443 10443 11443 12443; do
+    if ! port_in_use "${p}"; then
+      echo "${p}"
+      return 0
+    fi
+  done
+  # Last resort: choose a random high port with limited tries (no infinite loops)
+  local i p
+  for i in {1..50}; do
+    p=$(( (RANDOM % 20001) + 20000 ))
+    if ! port_in_use "${p}"; then
+      echo "${p}"
+      return 0
+    fi
+  done
+  # Worst-case fallback
+  echo "443"
+}
+
+# ---- systemd-less dockerd helpers ----
 systemd_usable() {
   cmd_exists systemctl || return 1
-  systemctl is-system-running >/dev/null 2>&1 && return 0
   systemctl list-units >/dev/null 2>&1 && return 0
   return 1
 }
@@ -154,12 +172,8 @@ docker_daemon_running() {
 }
 
 start_docker_daemon_best_effort() {
-  # This MUST NEVER crash the script.
   cmd_exists docker || return 1
-
-  if docker_daemon_running; then
-    return 0
-  fi
+  docker_daemon_running && return 0
 
   if systemd_usable; then
     systemctl enable --now docker >/dev/null 2>&1 || true
@@ -177,14 +191,11 @@ start_docker_daemon_best_effort() {
   nohup /usr/sbin/dockerd >/var/log/dockerd.log 2>&1 & disown || true
   sleep 2
   docker_daemon_running && return 0
-
   return 1
 }
 
 ensure_dockerd_persistence_if_no_systemd() {
-  if systemd_usable; then
-    return 0
-  fi
+  systemd_usable && return 0
   cmd_exists crontab || return 0
   local line='@reboot /usr/sbin/dockerd >/var/log/dockerd.log 2>&1 &'
   if crontab -l 2>/dev/null | grep -Fq "$line"; then
@@ -224,6 +235,7 @@ ensure_docker() {
   if cmd_exists docker && docker --version >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     log "Docker and Docker Compose are already installed."
   else
+    log "Installing required packages..."
     if ! cmd_exists docker; then
       log "Installing Docker (docker.io) from Ubuntu repos..."
       apt_install_min docker.io || true
@@ -248,60 +260,35 @@ ensure_docker() {
     docker compose version >/dev/null 2>&1 || die "Docker Compose installation failed."
   fi
 
-  # Start daemon best-effort, but here we REQUIRE it for installation to proceed.
   log "Starting Docker daemon..."
   if ! start_docker_daemon_best_effort; then
-    warn "Docker daemon did not start. Showing last 120 lines of /var/log/dockerd.log (if any):"
+    warn "Docker daemon did not start. Last 120 lines of /var/log/dockerd.log:"
     tail -n 120 /var/log/dockerd.log 2>/dev/null || true
     die "Docker daemon failed to start in this environment."
   fi
   ensure_dockerd_persistence_if_no_systemd
 }
 
-compose() { (cd "${BASE_DIR}" && docker compose "$@"); }
-
-# ============================================================
-# ✅ FIXED: nuclear clean MUST NOT FAIL if dockerd is down
-# ============================================================
+# -------------------------
+# SAFE targeted clean (never abort)
+# -------------------------
 nuclear_clean_project() {
   log "Nuclear clean (targeted) for ${APP_NAME}..."
-
-  # If docker exists but daemon is down, try to start it; if still down, skip docker cleanup safely.
   if cmd_exists docker; then
     if ! docker_daemon_running; then
-      warn "Docker daemon not running during clean. Attempting to start it (best-effort)..."
+      warn "Docker daemon not running during clean. Best-effort start..."
       start_docker_daemon_best_effort || true
     fi
 
-    if docker_daemon_running; then
-      # Stop compose stack if exists (must never abort)
-      if [[ -f "${COMPOSE_FILE}" ]]; then
-        (cd "${BASE_DIR}" && docker compose down --remove-orphans --volumes >/dev/null 2>&1) || true
-      fi
-      # Remove containers using this image (must never abort)
-      docker ps -a --format '{{.ID}} {{.Image}}' 2>/dev/null \
-        | awk -v img="${FPTN_IMAGE}" '$2==img {print $1}' \
-        | while read -r cid; do
-            [[ -n "${cid}" ]] && docker rm -f "${cid}" >/dev/null 2>&1 || true
-          done
-    else
-      warn "Docker daemon still not available. Skipping Docker cleanup (safe)."
+    if docker_daemon_running && [[ -f "${COMPOSE_FILE}" ]]; then
+      (cd "${BASE_DIR}" && docker compose down --remove-orphans --volumes >/dev/null 2>&1) || true
     fi
-  else
-    warn "Docker not installed yet. Skipping Docker cleanup."
   fi
-
-  # system/file cleanup should ALWAYS proceed
-  systemctl disable --now "${APP_NAME}-renew.timer" >/dev/null 2>&1 || true
-  rm -f "${RENEW_SERVICE}" "${RENEW_TIMER}" "${RENEW_SCRIPT}" >/dev/null 2>&1 || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
 
   rm -f "${SYMLINK_CAP}" "${SYMLINK_LOW}" >/dev/null 2>&1 || true
   rm -f "${MANAGER}" >/dev/null 2>&1 || true
-
   rm -rf "${BASE_DIR}" >/dev/null 2>&1 || true
   rm -rf /tmp/${APP_NAME}-* >/dev/null 2>&1 || true
-
   log "Clean complete."
 }
 
@@ -337,156 +324,28 @@ services:
       - "\${FPTN_PORT}:443/tcp"
     volumes:
       - ./fptn-server-data:/etc/fptn
-    environment:
-      - ENABLE_DETECT_PROBING=\${ENABLE_DETECT_PROBING}
-      - DEFAULT_PROXY_DOMAIN=\${DEFAULT_PROXY_DOMAIN}
-      - ALLOWED_SNI_LIST=\${ALLOWED_SNI_LIST}
-      - DISABLE_BITTORRENT=\${DISABLE_BITTORRENT}
-      - PROMETHEUS_SECRET_ACCESS_KEY=\${PROMETHEUS_SECRET_ACCESS_KEY}
-      - USE_REMOTE_SERVER_AUTH=\${USE_REMOTE_SERVER_AUTH}
-      - REMOTE_SERVER_AUTH_HOST=\${REMOTE_SERVER_AUTH_HOST}
-      - REMOTE_SERVER_AUTH_PORT=\${REMOTE_SERVER_AUTH_PORT}
-      - MAX_ACTIVE_SESSIONS_PER_USER=\${MAX_ACTIVE_SESSIONS_PER_USER}
-      - SERVER_EXTERNAL_IPS=\${SERVER_EXTERNAL_IPS}
-      - DNS_IPV4_PRIMARY=\${DNS_IPV4_PRIMARY}
-      - DNS_IPV4_SECONDARY=\${DNS_IPV4_SECONDARY}
-      - DNS_IPV6_PRIMARY=\${DNS_IPV6_PRIMARY}
-      - DNS_IPV6_SECONDARY=\${DNS_IPV6_SECONDARY}
-    healthcheck:
-      test: ["CMD", "sh", "-c", "pgrep dnsmasq && pgrep fptn-server"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
 YAML
+  [[ -s "${COMPOSE_FILE}" ]] || die "Failed to write ${COMPOSE_FILE}"
 }
 
 write_env_file() {
   local port="$1" pubip="$2"
-  local prom_key; prom_key="$(random_alnum 32)"
   cat > "${ENV_FILE}" <<EOF
 FPTN_PORT=${port}
 SERVER_EXTERNAL_IPS=${pubip}
-
-ENABLE_DETECT_PROBING=true
-DEFAULT_PROXY_DOMAIN=cdnvideo.com
-ALLOWED_SNI_LIST=
-DISABLE_BITTORRENT=true
-
-USE_REMOTE_SERVER_AUTH=false
-REMOTE_SERVER_AUTH_HOST=
-REMOTE_SERVER_AUTH_PORT=443
-
-PROMETHEUS_SECRET_ACCESS_KEY=${prom_key}
-MAX_ACTIVE_SESSIONS_PER_USER=3
-
-DNS_IPV4_PRIMARY=8.8.8.8
-DNS_IPV4_SECONDARY=8.8.4.4
-DNS_IPV6_PRIMARY=2001:4860:4860::8888
-DNS_IPV6_SECONDARY=2001:4860:4860::8844
 EOF
-}
-
-compose_up() {
-  log "Starting FKTN container..."
-  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" up -d) || die "docker compose up failed."
-}
-
-ensure_initial_self_signed() {
-  log "Ensuring initial TLS certs exist (non-interactive)..."
-  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" run --rm fptn-server sh -c \
-    "cd /etc/fptn && [ -f server.key ] || openssl genrsa -out server.key 2048") || true
-  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" run --rm fptn-server sh -c \
-    "cd /etc/fptn && [ -f server.crt ] || openssl req -new -x509 -key server.key -out server.crt -days 3650 -subj '/C=IR/ST=Tehran/L=Tehran/O=Iranux/OU=FKTN/CN=fktn-server'") || true
-}
-
-ufw_allow_if_active() {
-  local p="$1"
-  if cmd_exists ufw && ufw status | grep -qi "Status: active"; then
-    ufw allow "${p}/tcp" >/dev/null 2>&1 || true
-  fi
+  [[ -s "${ENV_FILE}" ]] || die "Failed to write ${ENV_FILE}"
 }
 
 write_manager_panel() {
   cat > "${MANAGER}" <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-
-APP_NAME="iranux-fktn"
-BASE_DIR="/opt/${APP_NAME}"
+BASE_DIR="/opt/iranux-fktn"
 ENV_FILE="${BASE_DIR}/.env"
-STATE_DIR="${BASE_DIR}/state"
-DOMAIN_STATE="${STATE_DIR}/domain.conf"
-CERT_STATE="${STATE_DIR}/cert.conf"
-
-die(){ echo "[x] $*" >&2; exit 1; }
-need_root(){ [[ "${EUID}" -eq 0 ]] || die "Run: sudo Iranux"; }
-
-cd "${BASE_DIR}" 2>/dev/null || die "Not installed. Run installer first."
-compose(){ (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" "$@"); }
-
-get_env(){ local k="$1"; grep -E "^${k}=" "${ENV_FILE}" | head -n1 | cut -d'=' -f2- || true; }
-public_ip(){ get_env SERVER_EXTERNAL_IPS; }
-public_port(){ get_env FPTN_PORT; }
-
-domain_get(){ [[ -f "${DOMAIN_STATE}" ]] && cat "${DOMAIN_STATE}" || true; }
-tls_status_line(){ [[ -f "${CERT_STATE}" ]] && cat "${CERT_STATE}" || echo "TLS: self-signed (default)"; }
-
-endpoint_line(){
-  local port dom ip
-  ip="$(public_ip)"; port="$(public_port)"; dom="$(domain_get)"
-  if [[ -n "${dom}" ]]; then
-    [[ "${port}" == "443" ]] && echo "Endpoint: ${dom} (preferred) | Fallback: ${ip}:443" || echo "Endpoint: ${dom}:${port} (preferred) | Fallback: ${ip}:${port}"
-  else
-    echo "Endpoint: ${ip}:${port}"
-  fi
-}
-
-banner(){
-  local ip port dom tls ep
-  ip="$(public_ip)"; port="$(public_port)"; dom="$(domain_get)"
-  tls="$(tls_status_line)"; ep="$(endpoint_line)"
-  echo "============================================================"
-  echo " Iranux | FKTN VPN Server Management"
-  echo "------------------------------------------------------------"
-  echo " Server IP   : ${ip:-unknown}"
-  echo " Server Port : ${port:-unknown}"
-  echo " Domain      : ${dom:-not set}"
-  echo " ${ep}"
-  echo " ${tls}"
-  echo "============================================================"
-}
-
-menu(){
-  echo
-  echo "1) Status (docker compose ps)"
-  echo "2) Tail logs (last 200)"
-  echo "3) Restart server"
-  echo "0) Exit"
-  echo
-}
-
-main(){
-  need_root
-  while true; do
-    clear || true
-    banner
-    menu
-    read -rp "Select: " c
-    case "${c}" in
-      1) compose ps ;;
-      2) compose logs --tail 200 -f ;;
-      3) compose restart ;;
-      0) echo "Bye."; exit 0 ;;
-      *) echo "Invalid option." ;;
-    esac
-    echo
-    read -rp "Press Enter to continue..." _ || true
-  done
-}
-main "$@"
+cd "${BASE_DIR}" 2>/dev/null || { echo "Not installed."; exit 1; }
+docker compose --env-file "${ENV_FILE}" ps
 BASH
-
   chmod 0755 "${MANAGER}"
   ln -sf "${MANAGER}" "${SYMLINK_CAP}"
   ln -sf "${MANAGER}" "${SYMLINK_LOW}"
@@ -503,26 +362,27 @@ install_main() {
   ensure_dirs
   ensure_docker
 
-  local pub_ip port
   log "Detecting public IPv4..."
+  local pub_ip
   pub_ip="$(detect_public_ipv4)" || die "Could not auto-detect public IPv4."
   log "Public IP detected: ${pub_ip}"
 
-  port="$(pick_port)"
+  log "Selecting external port for client connections..."
+  local port
+  port="$(pick_port_safe)"
   log "Selected external port for client connections: ${port}"
 
+  log "Writing docker-compose.yml and .env..."
   write_compose_file
   write_env_file "${port}" "${pub_ip}"
 
-  ufw_allow_if_active "${port}"
-  ufw_allow_if_active 80
+  log "Starting container..."
+  (cd "${BASE_DIR}" && docker compose --env-file "${ENV_FILE}" up -d)
 
-  compose_up
-  ensure_initial_self_signed
   write_manager_panel
 
   log "Installation completed successfully."
-  log "Opening management panel now..."
+  log "Run management panel: Iranux"
   exec "${SYMLINK_CAP}"
 }
 
