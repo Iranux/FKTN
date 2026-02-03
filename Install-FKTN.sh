@@ -304,6 +304,8 @@ services:
       - "\${FPTN_PORT}:443/tcp"
     volumes:
       - ./fptn-server-data:/etc/fptn
+    env_file:
+      - ./.env
     environment:
       - ENABLE_DETECT_PROBING=\${ENABLE_DETECT_PROBING}
       - DEFAULT_PROXY_DOMAIN=\${DEFAULT_PROXY_DOMAIN}
@@ -343,6 +345,14 @@ DNS_IPV6_PRIMARY=2001:4860:4860::8888
 DNS_IPV6_SECONDARY=2001:4860:4860::8844
 EOF
   [[ -s "${ENV_FILE}" ]] || die "Failed to write ${ENV_FILE}"
+}
+
+ensure_fptn_data_files() {
+  mkdir -p "${DATA_DIR}"
+  if [[ ! -f "${DATA_DIR}/users.list" ]]; then
+    touch "${DATA_DIR}/users.list"
+  fi
+  chmod 600 "${DATA_DIR}/users.list" >/dev/null 2>&1 || true
 }
 
 compose_up() {
@@ -388,6 +398,7 @@ install_main() {
   log "Writing docker-compose.yml and .env..."
   write_compose_file
   write_env_file "${port}" "${pub_ip}"
+  ensure_fptn_data_files
 
   compose_up
 
