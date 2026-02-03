@@ -104,6 +104,53 @@ pause(){
 }
 
 # -------------------------
+# Package helpers
+# -------------------------
+ensure_pkg(){
+  local pkg="$1"
+  if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y --no-install-recommends "${pkg}"
+  fi
+}
+
+# -------------------------
+# ✅ TLS bootstrap fix (NEW)
+# -------------------------
+ensure_tls_present_or_create() {
+  # Ensures ${DATA_DIR}/server.crt and ${DATA_DIR}/server.key exist.
+  # If missing, generates a self-signed cert and restarts container.
+
+  if [[ -f "${DATA_DIR}/server.crt" && -f "${DATA_DIR}/server.key" ]]; then
+    return 0
+  fi
+
+  yellow "[!] TLS certificate not found in ${DATA_DIR}. Creating self-signed cert..."
+
+  ensure_pkg openssl
+  mkdir -p "${DATA_DIR}"
+
+  # Prefer domain if set, else use server IP as CN
+  local cn
+  cn="$(domain_get)"
+  [[ -n "${cn}" ]] || cn="$(public_ip)"
+
+  openssl genrsa -out "${DATA_DIR}/server.key" 2048 >/dev/null 2>&1 || true
+  openssl req -new -x509 -key "${DATA_DIR}/server.key" -out "${DATA_DIR}/server.crt" -days 3650 \
+    -subj "/C=IR/ST=Tehran/L=Tehran/O=Iranux/OU=FKTN/CN=${cn}" >/dev/null 2>&1 || true
+
+  chmod 600 "${DATA_DIR}/server.key" >/dev/null 2>&1 || true
+  chmod 644 "${DATA_DIR}/server.crt" >/dev/null 2>&1 || true
+
+  echo "TLS: self-signed (generated locally)" > "${CERT_STATE}"
+
+  yellow "[*] Restarting server to load TLS..."
+  compose restart >/dev/null 2>&1 || true
+  green "[+] TLS is ready."
+}
+
+# -------------------------
 # Core actions
 # -------------------------
 status(){
@@ -138,7 +185,6 @@ add_user(){
 
   echo
   yellow "[!] If prompted for password, enter a strong password."
-  # Best-effort: If fptn-passwd exists, use it. If not, guide user.
   if compose exec -T fptn-server sh -c "command -v fptn-passwd >/dev/null 2>&1"; then
     compose exec fptn-server fptn-passwd --add-user "${u}" --bandwidth "${bw}"
     green "[+] User added (if no errors above)."
@@ -156,9 +202,13 @@ gen_token(){
   read -rsp "Password: " p; echo
   ip="$(public_ip)"; port="$(public_port)"
 
+  # ✅ Ensure TLS exists BEFORE token generation to prevent:
+  # "Certificate file not found: /etc/fptn/server.crt"
+  ensure_tls_present_or_create
+
   echo
   yellow "[*] Generating token..."
-  # Best-effort: token-generator (based on previous assumptions)
+
   if compose run --rm fptn-server sh -c "command -v token-generator >/dev/null 2>&1"; then
     compose run --rm fptn-server token-generator --user "${u}" --password "${p}" --server-ip "${ip}" --port "${port}"
     green "[+] Done."
@@ -179,15 +229,6 @@ gen_token(){
 #      * if still fails -> fallback self-signed (do not crash)
 #  - Install cert into FKTN data volume as server.key/server.crt
 # -------------------------
-ensure_pkg(){
-  local pkg="$1"
-  if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y --no-install-recommends "${pkg}"
-  fi
-}
-
 dns_points_to_server(){
   local dom="$1" ip res
   ip="$(public_ip)"
@@ -220,12 +261,12 @@ gen_self_signed_for_domain(){
   openssl genrsa -out "${DATA_DIR}/server.key" 2048 >/dev/null 2>&1 || true
   openssl req -new -x509 -key "${DATA_DIR}/server.key" -out "${DATA_DIR}/server.crt" -days 3650 \
     -subj "/C=IR/ST=Tehran/L=Tehran/O=Iranux/OU=FKTN/CN=${dom}" >/dev/null 2>&1 || true
+  echo "TLS: self-signed for ${dom} (fallback)" > "${CERT_STATE}"
 }
 
 stop_conflicting_web_servers_best_effort(){
   local stopped=0
 
-  # systemd path
   if command -v systemctl >/dev/null 2>&1; then
     for svc in nginx apache2 caddy lighttpd; do
       if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -236,15 +277,12 @@ stop_conflicting_web_servers_best_effort(){
     done
   fi
 
-  # service command path
   if command -v service >/dev/null 2>&1; then
     for svc in nginx apache2 caddy lighttpd; do
-      if service "$svc" status >/dev/null 2>&1; then
-        # not fully reliable, but fine as best-effort
-        yellow "[!] Attempting service stop: ${svc}"
-        service "$svc" stop >/dev/null 2>&1 || true
-        stopped=1
-      fi
+      service "$svc" status >/dev/null 2>&1 || continue
+      yellow "[!] Attempting service stop: ${svc}"
+      service "$svc" stop >/dev/null 2>&1 || true
+      stopped=1
     done
   fi
 
@@ -287,14 +325,12 @@ enable_domain_ssl(){
   fi
   green "[+] DNS OK."
 
-  # If port 80 is occupied, try stopping known web servers
   if port80_in_use; then
     yellow "[!] Port 80 is in use. Attempting to stop common conflicting services..."
     stop_conflicting_web_servers_best_effort >/dev/null 2>&1 || true
     sleep 1
   fi
 
-  # Try LE up to 3 times
   echo
   yellow "[*] Requesting Let's Encrypt certificate (standalone on :80)..."
   for i in 1 2 3; do
@@ -315,16 +351,13 @@ enable_domain_ssl(){
     yellow "[!] Falling back to self-signed cert (server will still work)."
     gen_self_signed_for_domain "${dom}"
     compose restart
-    write_tls_state "TLS: self-signed for ${dom} (fallback)"
     green "[+] Fallback TLS applied."
     return 0
   fi
 
-  # Install cert into FKTN volume and restart
   install_cert_into_fktn "${dom}"
   compose restart
 
-  # Write TLS state with expiry
   local exp
   exp="$(openssl x509 -in "/etc/letsencrypt/live/${dom}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d'=' -f2 || true)"
   write_tls_state "TLS: Let's Encrypt for ${dom} (expires: ${exp:-unknown})"
